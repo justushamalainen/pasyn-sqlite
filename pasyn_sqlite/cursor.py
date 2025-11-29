@@ -111,12 +111,18 @@ class Cursor:
         pool = self._connection._pool
         is_read = pool._is_read_operation(sql)
 
-        if is_read:
-            future = pool.submit_read(
+        # If we're in a transaction, ALL statements go to writer thread
+        # to maintain transaction semantics (same connection required)
+        in_transaction = self._connection._current_transaction is not None
+
+        if in_transaction or not is_read:
+            # Writer thread: transactions or write operations
+            future = pool.submit_write(
                 self._execute_in_thread, sql, parameters, is_read
             )
         else:
-            future = pool.submit_write(
+            # Reader thread: non-transactional reads
+            future = pool.submit_read(
                 self._execute_in_thread, sql, parameters, is_read
             )
 

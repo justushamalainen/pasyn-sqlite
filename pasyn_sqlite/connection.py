@@ -9,6 +9,13 @@ from typing import Any, Callable, Sequence
 from .cursor import Cursor
 from .exceptions import ConnectionClosedError
 from .pool import ThreadPool
+from .transactions import (
+    IsolationLevel,
+    Savepoint,
+    Transaction,
+    TransactionContext,
+    TransactionQueue,
+)
 
 
 class Connection:
@@ -44,6 +51,8 @@ class Connection:
             **kwargs,
         )
         self._closed = False
+        self._transaction_queue = TransactionQueue()
+        self._current_transaction: TransactionContext | None = None
 
     def _check_closed(self) -> None:
         """Raise an error if the connection is closed."""
@@ -203,8 +212,73 @@ class Connection:
         if self._closed:
             return
 
+        # Rollback any active transaction before closing
+        if self._current_transaction is not None:
+            try:
+                await self.rollback()
+            except Exception:
+                pass  # Best effort rollback
+            self._current_transaction = None
+
         self._closed = True
         self._pool.close(wait=True)
+
+    def transaction(
+        self,
+        isolation: IsolationLevel = IsolationLevel.DEFERRED,
+    ) -> Transaction:
+        """
+        Create a transaction context manager.
+
+        All statements within the transaction execute on the writer thread
+        to ensure atomicity.
+
+        Args:
+            isolation: Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE).
+
+        Returns:
+            Transaction context manager.
+
+        Example:
+            async with conn.transaction():
+                await conn.execute("INSERT INTO users (name) VALUES (?)", ("Alice",))
+                await conn.execute("UPDATE accounts SET balance = balance - 100")
+                # Auto-commits on success, auto-rollbacks on exception
+
+            # With isolation level:
+            async with conn.transaction(isolation=IsolationLevel.IMMEDIATE):
+                ...
+
+            # Nested (uses savepoints):
+            async with conn.transaction():
+                await conn.execute("INSERT ...")
+                async with conn.transaction():  # Creates savepoint
+                    await conn.execute("INSERT ...")
+        """
+        self._check_closed()
+        return Transaction(self, isolation=isolation)
+
+    def savepoint(self, name: str | None = None) -> Savepoint:
+        """
+        Create an explicit savepoint context manager.
+
+        Must be called within an active transaction.
+
+        Args:
+            name: Optional savepoint name. Auto-generated if not provided.
+
+        Returns:
+            Savepoint context manager.
+
+        Example:
+            async with conn.transaction():
+                await conn.execute("INSERT ...")
+                async with conn.savepoint("my_savepoint"):
+                    await conn.execute("INSERT ...")
+                    # Can rollback independently
+        """
+        self._check_closed()
+        return Savepoint(self, name=name)
 
     async def create_function(
         self,

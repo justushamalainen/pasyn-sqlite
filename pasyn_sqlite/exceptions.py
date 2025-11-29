@@ -32,3 +32,21 @@ class ConnectionClosedError(PoolError):
     """Raised when attempting to use a closed connection."""
 
     pass
+
+
+class TransactionError(PoolError):
+    """Base exception for transaction errors."""
+
+    pass
+
+
+class TransactionAlreadyActiveError(TransactionError):
+    """Raised when starting a transaction while one is already active."""
+
+    pass
+
+
+class NoActiveTransactionError(TransactionError):
+    """Raised when committing/rolling back without an active transaction."""
+
+    pass

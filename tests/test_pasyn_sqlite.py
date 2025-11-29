@@ -595,3 +595,213 @@ class TestEdgeCases:
             cursor = await conn.execute("SELECT * FROM test")
             row = await cursor.fetchone()
             assert row[0] == binary_data
+
+
+class TestTransactions:
+    """Test transaction support."""
+
+    @pytest.fixture
+    def db_path(self, tmp_path: Path) -> str:
+        """Create a temporary database path."""
+        return str(tmp_path / "test.db")
+
+    @pytest.mark.asyncio
+    async def test_basic_transaction_commit(self, db_path: str) -> None:
+        """Test basic transaction with automatic commit."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+            await conn.commit()
+
+            async with conn.transaction():
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("one",))
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("two",))
+            # Auto-committed
+
+            cursor = await conn.execute("SELECT COUNT(*) FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == 2
+
+    @pytest.mark.asyncio
+    async def test_transaction_rollback_on_exception(self, db_path: str) -> None:
+        """Test transaction rollback on exception."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+            await conn.commit()
+
+            # Insert initial value
+            await conn.execute("INSERT INTO test (value) VALUES (?)", ("original",))
+            await conn.commit()
+
+            # Try a transaction that fails
+            try:
+                async with conn.transaction():
+                    await conn.execute("INSERT INTO test (value) VALUES (?)", ("new",))
+                    raise ValueError("Simulated error")
+            except ValueError:
+                pass  # Expected
+
+            # Should only have the original value
+            cursor = await conn.execute("SELECT COUNT(*) FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == 1
+
+            cursor = await conn.execute("SELECT value FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == "original"
+
+    @pytest.mark.asyncio
+    async def test_nested_transaction_with_savepoint(self, db_path: str) -> None:
+        """Test nested transactions use savepoints."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+            await conn.commit()
+
+            async with conn.transaction():
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("outer",))
+
+                # Nested transaction (savepoint)
+                try:
+                    async with conn.transaction():
+                        await conn.execute("INSERT INTO test (value) VALUES (?)", ("inner",))
+                        raise ValueError("Inner error")
+                except ValueError:
+                    pass  # Inner transaction rolled back
+
+                # Outer transaction continues
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("after",))
+            # Outer commits
+
+            cursor = await conn.execute("SELECT value FROM test ORDER BY id")
+            rows = await cursor.fetchall()
+            assert len(rows) == 2
+            assert rows[0][0] == "outer"
+            assert rows[1][0] == "after"
+
+    @pytest.mark.asyncio
+    async def test_savepoint_explicit(self, db_path: str) -> None:
+        """Test explicit savepoint context manager."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+            await conn.commit()
+
+            async with conn.transaction():
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("one",))
+
+                async with conn.savepoint("sp1"):
+                    await conn.execute("INSERT INTO test (value) VALUES (?)", ("two",))
+                # Savepoint released (committed)
+
+                try:
+                    async with conn.savepoint("sp2"):
+                        await conn.execute("INSERT INTO test (value) VALUES (?)", ("three",))
+                        raise ValueError("Rollback sp2")
+                except ValueError:
+                    pass  # sp2 rolled back
+
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("four",))
+            # Transaction committed
+
+            cursor = await conn.execute("SELECT value FROM test ORDER BY id")
+            rows = await cursor.fetchall()
+            assert len(rows) == 3
+            assert [r[0] for r in rows] == ["one", "two", "four"]
+
+    @pytest.mark.asyncio
+    async def test_transaction_isolation_levels(self, db_path: str) -> None:
+        """Test different isolation levels."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)")
+            await conn.commit()
+
+            # Test DEFERRED (default)
+            async with conn.transaction(isolation=pasyn_sqlite.IsolationLevel.DEFERRED):
+                await conn.execute("INSERT INTO test DEFAULT VALUES")
+
+            # Test IMMEDIATE
+            async with conn.transaction(isolation=pasyn_sqlite.IsolationLevel.IMMEDIATE):
+                await conn.execute("INSERT INTO test DEFAULT VALUES")
+
+            # Test EXCLUSIVE
+            async with conn.transaction(isolation=pasyn_sqlite.IsolationLevel.EXCLUSIVE):
+                await conn.execute("INSERT INTO test DEFAULT VALUES")
+
+            cursor = await conn.execute("SELECT COUNT(*) FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == 3
+
+    @pytest.mark.asyncio
+    async def test_reads_in_transaction_go_to_writer(self, db_path: str) -> None:
+        """Test that reads within transaction use writer thread."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+            await conn.commit()
+
+            async with conn.transaction():
+                await conn.execute("INSERT INTO test (value) VALUES (?)", ("one",))
+
+                # This read should see the uncommitted data
+                # because it's on the same connection (writer)
+                cursor = await conn.execute("SELECT COUNT(*) FROM test")
+                row = await cursor.fetchone()
+                assert row[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transactions_serialize(self, db_path: str) -> None:
+        """Test that concurrent transactions serialize properly."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value INTEGER)")
+            await conn.commit()
+
+            results = []
+
+            async def transaction_task(value: int) -> None:
+                async with conn.transaction():
+                    await conn.execute("INSERT INTO test (value) VALUES (?)", (value,))
+                    await asyncio.sleep(0.01)  # Simulate work
+                    cursor = await conn.execute("SELECT MAX(id) FROM test")
+                    row = await cursor.fetchone()
+                    results.append((value, row[0]))
+
+            # Start multiple transactions concurrently
+            await asyncio.gather(
+                transaction_task(1),
+                transaction_task(2),
+                transaction_task(3),
+            )
+
+            # All should have completed
+            cursor = await conn.execute("SELECT COUNT(*) FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == 3
+
+            # Each transaction should have seen consistent state
+            assert len(results) == 3
+
+    @pytest.mark.asyncio
+    async def test_savepoint_outside_transaction_error(self, db_path: str) -> None:
+        """Test that savepoint outside transaction raises error."""
+        async with await pasyn_sqlite.connect(db_path) as conn:
+            with pytest.raises(pasyn_sqlite.NoActiveTransactionError):
+                async with conn.savepoint("sp1"):
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_transaction_close_connection(self, db_path: str) -> None:
+        """Test that closing connection with active transaction rollbacks."""
+        conn = await pasyn_sqlite.connect(db_path)
+        await conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)")
+        await conn.commit()
+
+        # Start a transaction
+        tx = conn.transaction()
+        await tx.__aenter__()
+        await conn.execute("INSERT INTO test DEFAULT VALUES")
+
+        # Close connection without exiting transaction
+        await conn.close()
+
+        # Verify rollback happened by opening new connection
+        async with await pasyn_sqlite.connect(db_path) as conn2:
+            cursor = await conn2.execute("SELECT COUNT(*) FROM test")
+            row = await cursor.fetchone()
+            assert row[0] == 0  # Rolled back

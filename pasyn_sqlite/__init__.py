@@ -41,14 +41,18 @@ from .exceptions import (
     IntegrityError,
     InterfaceError,
     InternalError,
+    NoActiveTransactionError,
     NotSupportedError,
     OperationalError,
     PoolClosedError,
     PoolError,
     ProgrammingError,
+    TransactionAlreadyActiveError,
+    TransactionError,
     Warning,
 )
 from .pool import ThreadPool
+from .transactions import IsolationLevel, Savepoint, Transaction, TransactionContext
 
 __version__ = "0.1.0"
 
@@ -58,10 +62,18 @@ __all__ = [
     "Connection",
     "Cursor",
     "ThreadPool",
+    # Transactions
+    "Transaction",
+    "TransactionContext",
+    "Savepoint",
+    "IsolationLevel",
     # Exceptions
     "PoolError",
     "PoolClosedError",
     "ConnectionClosedError",
+    "TransactionError",
+    "TransactionAlreadyActiveError",
+    "NoActiveTransactionError",
     # Re-exported sqlite3 exceptions
     "Error",
     "Warning",
