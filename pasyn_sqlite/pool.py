@@ -95,6 +95,12 @@ class ThreadPool:
             check_same_thread: SQLite check_same_thread parameter.
             **sqlite_kwargs: Additional kwargs passed to sqlite3.connect().
         """
+        # Handle in-memory databases - use shared cache so all connections
+        # see the same data
+        if database == ":memory:":
+            database = "file::memory:?cache=shared"
+            sqlite_kwargs.setdefault("uri", True)
+
         self._database = database
         self._num_readers = num_readers
         self._sqlite_kwargs = {

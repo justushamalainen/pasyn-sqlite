@@ -50,3 +50,9 @@ class NoActiveTransactionError(TransactionError):
     """Raised when committing/rolling back without an active transaction."""
 
     pass
+
+
+class TransactionCommandError(PoolError):
+    """Raised when transaction commands are used on Pool (use bound_connection instead)."""
+
+    pass

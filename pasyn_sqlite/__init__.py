@@ -9,30 +9,48 @@ Example:
     import pasyn_sqlite
 
     async def main():
-        async with await pasyn_sqlite.connect("mydb.sqlite") as conn:
-            # Create a table
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT
-                )
-            ''')
-            await conn.commit()
+        # Create a pool
+        pool = await pasyn_sqlite.create_pool("mydb.sqlite")
 
-            # Insert data (goes to writer thread)
-            await conn.execute("INSERT INTO users (name) VALUES (?)", ("Alice",))
-            await conn.commit()
+        # Simple queries - auto-routed to writer/reader
+        await pool.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )
+        ''')
 
-            # Query data (goes to reader threads with work-stealing)
-            cursor = await conn.execute("SELECT * FROM users")
-            rows = await cursor.fetchall()
-            print(rows)
+        # Insert data (goes to writer thread)
+        await pool.execute("INSERT INTO users (name) VALUES (?)", ("Alice",))
+
+        # Query data (goes to reader threads)
+        cursor = await pool.execute("SELECT * FROM users")
+        rows = await cursor.fetchall()
+        print(rows)
+
+        # Transactions - use bound_connection
+        async with pool.bound_connection() as conn:
+            await conn.execute("BEGIN")
+            await conn.execute("INSERT INTO users (name) VALUES (?)", ("Bob",))
+            await conn.execute("INSERT INTO users (name) VALUES (?)", ("Charlie",))
+            await conn.execute("COMMIT")
+
+        await pool.close()
 
     asyncio.run(main())
 """
 
+# New Pool API
+from .pasyn_pool import (
+    BoundConnection,
+    Cursor,
+    PasynPool,
+    create_pool,
+)
+
+# Legacy API (kept for compatibility)
 from .connection import Connection, connect
-from .cursor import Cursor
+
 from .exceptions import (
     ConnectionClosedError,
     DatabaseError,
@@ -48,6 +66,7 @@ from .exceptions import (
     PoolError,
     ProgrammingError,
     TransactionAlreadyActiveError,
+    TransactionCommandError,
     TransactionError,
     Warning,
 )
@@ -57,12 +76,16 @@ from .transactions import IsolationLevel, Savepoint, Transaction, TransactionCon
 __version__ = "0.1.0"
 
 __all__ = [
-    # Main API
+    # New Pool API
+    "create_pool",
+    "PasynPool",
+    "BoundConnection",
+    "Cursor",
+    # Legacy API
     "connect",
     "Connection",
-    "Cursor",
     "ThreadPool",
-    # Transactions
+    # Transactions (legacy)
     "Transaction",
     "TransactionContext",
     "Savepoint",
@@ -74,6 +97,7 @@ __all__ = [
     "TransactionError",
     "TransactionAlreadyActiveError",
     "NoActiveTransactionError",
+    "TransactionCommandError",
     # Re-exported sqlite3 exceptions
     "Error",
     "Warning",
