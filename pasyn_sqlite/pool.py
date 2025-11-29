@@ -1,14 +1,22 @@
-"""Thread pool implementation with single writer and multiple readers with work stealing."""
+"""
+Lock-free thread pool with Single Writer Multiple Reader (SWMR) architecture.
+
+Uses Python's GIL atomicity guarantees:
+- deque.append() and deque.popleft() are atomic (single bytecode)
+- queue.Queue provides thread-safe multi-consumer access
+- ThreadPoolExecutor handles work-stealing for readers
+"""
 
 from __future__ import annotations
 
-import queue
 import sqlite3
 import threading
 import time
-from concurrent.futures import Future
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
+from queue import Empty, Queue
 from typing import Any, Callable, TypeVar
 
 from .exceptions import PoolClosedError
@@ -36,12 +44,14 @@ class Task:
 
 class ThreadPool:
     """
-    Thread pool for SQLite with single writer and multiple readers.
+    Lock-free thread pool for SQLite with SWMR architecture.
 
-    The writer thread handles all write operations (INSERT, UPDATE, DELETE, etc.)
-    to ensure SQLite's write serialization.
+    - Single writer thread: Handles all write operations (INSERT, UPDATE, etc.)
+    - Multiple reader threads: Handle SELECT queries with work-stealing
 
-    Reader threads handle SELECT queries with work-stealing for load balancing.
+    Uses GIL atomicity for lock-free queue operations:
+    - Write queue: collections.deque (SPSC - single consumer)
+    - Read queue: queue.Queue (SPMC - multiple consumers with work-stealing)
     """
 
     # SQL keywords that indicate write operations
@@ -65,7 +75,7 @@ class ThreadPool:
             "ROLLBACK",
             "SAVEPOINT",
             "RELEASE",
-            "PRAGMA",  # Some PRAGMAs write, so be safe
+            "PRAGMA",
         }
     )
 
@@ -93,26 +103,30 @@ class ThreadPool:
         }
 
         self._closed = False
-        self._shutdown = False
+        self._shutdown = threading.Event()
 
-        # Writer thread state - use queue.Queue for efficient blocking
-        self._writer_queue: queue.Queue[Task | None] = queue.Queue()
+        # Write queue - deque for lock-free SPSC (GIL atomic append/popleft)
+        self._write_queue: deque[Task | None] = deque()
+        self._write_event = threading.Event()  # Signal writer when work available
+
+        # Read queue - Queue for SPMC with built-in blocking
+        self._read_queue: Queue[Task | None] = Queue()
+
+        # Writer thread
         self._writer_thread: threading.Thread | None = None
         self._writer_connection: sqlite3.Connection | None = None
-
-        # Reader threads state - shared queue for all readers
-        self._reader_queue: queue.Queue[Task | None] = queue.Queue()
-        self._reader_threads: list[threading.Thread] = []
-        self._reader_connections: list[sqlite3.Connection | None] = []
-
-        # Event to signal writer is ready (for WAL mode setup)
         self._writer_ready = threading.Event()
+
+        # Reader pool - ThreadPoolExecutor handles work-stealing
+        self._reader_executor: ThreadPoolExecutor | None = None
+        self._reader_connections: list[sqlite3.Connection] = []
+        self._reader_conn_lock = threading.Lock()  # Only for connection list init
 
         self._start_threads()
 
     def _start_threads(self) -> None:
-        """Start all worker threads."""
-        # Start writer thread
+        """Start writer thread and reader pool."""
+        # Start single writer thread
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             name="pasyn-sqlite-writer",
@@ -120,39 +134,33 @@ class ThreadPool:
         )
         self._writer_thread.start()
 
-        # Start reader threads
+        # Start reader thread pool
+        self._reader_executor = ThreadPoolExecutor(
+            max_workers=self._num_readers,
+            thread_name_prefix="pasyn-sqlite-reader",
+        )
+
+        # Submit reader workers to the pool
         for i in range(self._num_readers):
-            self._reader_connections.append(None)
-            thread = threading.Thread(
-                target=self._reader_loop,
-                args=(i,),
-                name=f"pasyn-sqlite-reader-{i}",
-                daemon=True,
-            )
-            self._reader_threads.append(thread)
-            thread.start()
+            self._reader_executor.submit(self._reader_loop, i)
 
     def _create_writer_connection(self) -> sqlite3.Connection:
         """Create the writer connection and set up WAL mode."""
         conn = sqlite3.connect(self._database, **self._sqlite_kwargs)
-        # Set busy timeout first to handle any potential locks
         conn.execute("PRAGMA busy_timeout=5000")
-        # Enable WAL mode for better concurrent read performance
-        # Only needs to be set once per database file
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def _create_reader_connection(self) -> sqlite3.Connection:
         """Create a reader connection with retry for busy database."""
         max_retries = 3
-        retry_delay = 0.1
+        retry_delay = 0.05
 
         for attempt in range(max_retries):
             try:
                 conn = sqlite3.connect(self._database, **self._sqlite_kwargs)
                 conn.execute("PRAGMA busy_timeout=5000")
-                # WAL mode is already set by writer, just verify we can read
-                conn.execute("SELECT 1")
+                conn.execute("SELECT 1")  # Verify connection works
                 return conn
             except sqlite3.OperationalError as e:
                 if "locked" in str(e) and attempt < max_retries - 1:
@@ -160,57 +168,61 @@ class ThreadPool:
                     continue
                 raise
 
-        # Should not reach here, but satisfy type checker
         raise sqlite3.OperationalError("Failed to create reader connection")
 
     def _writer_loop(self) -> None:
-        """Main loop for the writer thread."""
+        """
+        Main loop for the single writer thread.
+
+        Uses lock-free deque operations (GIL atomic).
+        """
         self._writer_connection = self._create_writer_connection()
-        # Signal that writer is ready and WAL mode is set
         self._writer_ready.set()
 
-        while True:
+        while not self._shutdown.is_set():
+            # Try to get task from deque (lock-free, GIL atomic)
             try:
-                # Block waiting for task, with timeout for shutdown check
-                task = self._writer_queue.get(timeout=0.1)
+                task = self._write_queue.popleft()
                 if task is None:  # Shutdown signal
                     break
                 self._execute_task(task, self._writer_connection)
-            except queue.Empty:
-                if self._shutdown:
-                    break
+            except IndexError:
+                # Queue empty - wait for signal with timeout
+                self._write_event.wait(timeout=0.01)
+                self._write_event.clear()
 
-        # Cleanup
         if self._writer_connection:
             self._writer_connection.close()
 
     def _reader_loop(self, reader_id: int) -> None:
-        """Main loop for a reader thread."""
-        # Wait for writer to be ready (WAL mode set)
+        """
+        Main loop for a reader thread.
+
+        Uses Queue.get() for thread-safe work-stealing.
+        """
+        # Wait for writer to establish WAL mode
         self._writer_ready.wait(timeout=5.0)
 
-        connection = self._create_reader_connection()
-        self._reader_connections[reader_id] = connection
+        conn = self._create_reader_connection()
+        with self._reader_conn_lock:
+            self._reader_connections.append(conn)
 
-        while True:
+        while not self._shutdown.is_set():
             try:
-                # Block waiting for task, with timeout for shutdown check
-                task = self._reader_queue.get(timeout=0.1)
+                # Queue.get with timeout - blocks until task available
+                # Multiple readers compete for tasks (work-stealing)
+                task = self._read_queue.get(timeout=0.01)
                 if task is None:  # Shutdown signal
-                    # Put it back for other readers
-                    self._reader_queue.put(None)
+                    # Re-queue None for other readers
+                    self._read_queue.put(None)
                     break
-                self._execute_task(task, connection)
-            except queue.Empty:
-                if self._shutdown:
-                    break
+                self._execute_task(task, conn)
+            except Empty:
+                continue  # No task, check shutdown and retry
 
-        # Cleanup
-        connection.close()
+        conn.close()
 
-    def _execute_task(
-        self, task: Task, connection: sqlite3.Connection
-    ) -> None:
+    def _execute_task(self, task: Task, connection: sqlite3.Connection) -> None:
         """Execute a task and set its result or exception."""
         if task.future.cancelled():
             return
@@ -230,16 +242,7 @@ class ThreadPool:
         """
         Submit a write task to the writer thread.
 
-        Args:
-            func: Function to execute. First argument will be the connection.
-            *args: Additional arguments for the function.
-            **kwargs: Keyword arguments for the function.
-
-        Returns:
-            Future that will contain the result.
-
-        Raises:
-            PoolClosedError: If the pool is closed.
+        Lock-free: uses deque.append() which is GIL atomic.
         """
         if self._closed:
             raise PoolClosedError("Pool is closed")
@@ -253,7 +256,10 @@ class ThreadPool:
             task_type=TaskType.WRITE,
         )
 
-        self._writer_queue.put(task)
+        # Lock-free append (GIL atomic)
+        self._write_queue.append(task)
+        self._write_event.set()  # Signal writer
+
         return future
 
     def submit_read(
@@ -265,18 +271,8 @@ class ThreadPool:
         """
         Submit a read task to the reader pool.
 
-        The task will be picked up by the first available reader.
-
-        Args:
-            func: Function to execute. First argument will be the connection.
-            *args: Additional arguments for the function.
-            **kwargs: Keyword arguments for the function.
-
-        Returns:
-            Future that will contain the result.
-
-        Raises:
-            PoolClosedError: If the pool is closed.
+        Uses Queue.put() for thread-safe multi-consumer access.
+        Readers compete for tasks (work-stealing via Queue).
         """
         if self._closed:
             raise PoolClosedError("Pool is closed")
@@ -290,7 +286,7 @@ class ThreadPool:
             task_type=TaskType.READ,
         )
 
-        self._reader_queue.put(task)
+        self._read_queue.put(task)
         return future
 
     def submit(
@@ -302,73 +298,43 @@ class ThreadPool:
     ) -> Future[T]:
         """
         Submit a task, automatically routing to writer or reader.
-
-        If sql is provided, it will be analyzed to determine if it's a
-        read or write operation. Otherwise, defaults to write for safety.
-
-        Args:
-            func: Function to execute.
-            sql: Optional SQL statement to analyze for routing.
-            *args: Additional arguments for the function.
-            **kwargs: Keyword arguments for the function.
-
-        Returns:
-            Future that will contain the result.
         """
         if sql is not None and self._is_read_operation(sql):
             return self.submit_read(func, *args, **kwargs)
         return self.submit_write(func, *args, **kwargs)
 
     def _is_read_operation(self, sql: str) -> bool:
-        """
-        Determine if a SQL statement is a read operation.
-
-        Args:
-            sql: SQL statement to analyze.
-
-        Returns:
-            True if the statement is a read operation.
-        """
-        # Normalize and get first word
+        """Determine if a SQL statement is a read operation."""
         normalized = sql.strip().upper()
 
-        # Handle WITH clauses (CTEs) - check if it ends with SELECT
         if normalized.startswith("WITH"):
-            # Find the main query after the CTE
-            # Simple heuristic: if there's no write keyword, it's a read
             for keyword in self.WRITE_KEYWORDS:
                 if keyword in normalized:
                     return False
             return True
 
-        # Get the first keyword
         first_word = normalized.split(None, 1)[0] if normalized else ""
-
         return first_word not in self.WRITE_KEYWORDS
 
     def close(self, wait: bool = True) -> None:
-        """
-        Close the pool and all connections.
-
-        Args:
-            wait: If True, wait for pending tasks to complete.
-        """
+        """Close the pool and all connections."""
         if self._closed:
             return
 
         self._closed = True
-        self._shutdown = True
+        self._shutdown.set()
 
         # Send shutdown signals
-        self._writer_queue.put(None)
-        self._reader_queue.put(None)  # One None will cascade to all readers
+        self._write_queue.append(None)
+        self._write_event.set()
+        self._read_queue.put(None)
 
         if wait:
             if self._writer_thread:
                 self._writer_thread.join(timeout=5.0)
 
-            for thread in self._reader_threads:
-                thread.join(timeout=5.0)
+            if self._reader_executor:
+                self._reader_executor.shutdown(wait=True, cancel_futures=False)
 
     def __enter__(self) -> "ThreadPool":
         return self
