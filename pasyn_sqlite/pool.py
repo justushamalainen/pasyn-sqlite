@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import queue
 import sqlite3
 import threading
 import time
-from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, TypeVar
 
@@ -34,15 +34,6 @@ class Task:
     task_type: TaskType
 
 
-@dataclass
-class ReaderState:
-    """State for a single reader thread."""
-
-    local_queue: deque[Task] = field(default_factory=deque)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    thread: threading.Thread | None = None
-
-
 class ThreadPool:
     """
     Thread pool for SQLite with single writer and multiple readers.
@@ -51,8 +42,6 @@ class ThreadPool:
     to ensure SQLite's write serialization.
 
     Reader threads handle SELECT queries with work-stealing for load balancing.
-    When a reader's local queue is empty, it attempts to steal work from other
-    readers before checking the shared queue.
     """
 
     # SQL keywords that indicate write operations
@@ -104,21 +93,17 @@ class ThreadPool:
         }
 
         self._closed = False
-        self._shutdown_event = threading.Event()
+        self._shutdown = False
 
-        # Writer thread state
-        self._writer_queue: deque[Task] = deque()
-        self._writer_lock = threading.Lock()
-        self._writer_event = threading.Event()
+        # Writer thread state - use queue.Queue for efficient blocking
+        self._writer_queue: queue.Queue[Task | None] = queue.Queue()
         self._writer_thread: threading.Thread | None = None
         self._writer_connection: sqlite3.Connection | None = None
 
-        # Reader threads state
-        self._readers: list[ReaderState] = []
+        # Reader threads state - shared queue for all readers
+        self._reader_queue: queue.Queue[Task | None] = queue.Queue()
+        self._reader_threads: list[threading.Thread] = []
         self._reader_connections: list[sqlite3.Connection | None] = []
-        self._shared_read_queue: deque[Task] = deque()
-        self._shared_read_lock = threading.Lock()
-        self._reader_event = threading.Event()
 
         # Event to signal writer is ready (for WAL mode setup)
         self._writer_ready = threading.Event()
@@ -137,17 +122,14 @@ class ThreadPool:
 
         # Start reader threads
         for i in range(self._num_readers):
-            state = ReaderState()
-            self._readers.append(state)
             self._reader_connections.append(None)
-
             thread = threading.Thread(
                 target=self._reader_loop,
                 args=(i,),
                 name=f"pasyn-sqlite-reader-{i}",
                 daemon=True,
             )
-            state.thread = thread
+            self._reader_threads.append(thread)
             thread.start()
 
     def _create_writer_connection(self) -> sqlite3.Connection:
@@ -187,81 +169,44 @@ class ThreadPool:
         # Signal that writer is ready and WAL mode is set
         self._writer_ready.set()
 
-        while not self._shutdown_event.is_set():
-            task = None
-
-            with self._writer_lock:
-                if self._writer_queue:
-                    task = self._writer_queue.popleft()
-
-            if task is not None:
+        while True:
+            try:
+                # Block waiting for task, with timeout for shutdown check
+                task = self._writer_queue.get(timeout=0.1)
+                if task is None:  # Shutdown signal
+                    break
                 self._execute_task(task, self._writer_connection)
-            else:
-                # Wait for new work or shutdown
-                self._writer_event.wait(timeout=0.1)
-                self._writer_event.clear()
+            except queue.Empty:
+                if self._shutdown:
+                    break
 
         # Cleanup
         if self._writer_connection:
             self._writer_connection.close()
 
     def _reader_loop(self, reader_id: int) -> None:
-        """Main loop for a reader thread with work stealing."""
+        """Main loop for a reader thread."""
         # Wait for writer to be ready (WAL mode set)
         self._writer_ready.wait(timeout=5.0)
 
         connection = self._create_reader_connection()
         self._reader_connections[reader_id] = connection
-        my_state = self._readers[reader_id]
 
-        while not self._shutdown_event.is_set():
-            task = self._get_reader_task(reader_id, my_state)
-
-            if task is not None:
+        while True:
+            try:
+                # Block waiting for task, with timeout for shutdown check
+                task = self._reader_queue.get(timeout=0.1)
+                if task is None:  # Shutdown signal
+                    # Put it back for other readers
+                    self._reader_queue.put(None)
+                    break
                 self._execute_task(task, connection)
-            else:
-                # Wait for new work or shutdown
-                self._reader_event.wait(timeout=0.1)
-                self._reader_event.clear()
+            except queue.Empty:
+                if self._shutdown:
+                    break
 
         # Cleanup
         connection.close()
-
-    def _get_reader_task(
-        self, reader_id: int, my_state: ReaderState
-    ) -> Task | None:
-        """
-        Get a task for a reader using work-stealing strategy.
-
-        Priority:
-        1. Local queue (fast path)
-        2. Steal from other readers
-        3. Shared queue (new work distribution)
-        """
-        # 1. Try local queue first (fast path)
-        with my_state.lock:
-            if my_state.local_queue:
-                return my_state.local_queue.popleft()
-
-        # 2. Try to steal from other readers
-        for i, other_state in enumerate(self._readers):
-            if i == reader_id:
-                continue
-
-            with other_state.lock:
-                if other_state.local_queue:
-                    # Steal from the back (opposite end from owner)
-                    try:
-                        return other_state.local_queue.pop()
-                    except IndexError:
-                        continue
-
-        # 3. Try shared queue
-        with self._shared_read_lock:
-            if self._shared_read_queue:
-                return self._shared_read_queue.popleft()
-
-        return None
 
     def _execute_task(
         self, task: Task, connection: sqlite3.Connection
@@ -308,10 +253,7 @@ class ThreadPool:
             task_type=TaskType.WRITE,
         )
 
-        with self._writer_lock:
-            self._writer_queue.append(task)
-        self._writer_event.set()
-
+        self._writer_queue.put(task)
         return future
 
     def submit_read(
@@ -323,8 +265,7 @@ class ThreadPool:
         """
         Submit a read task to the reader pool.
 
-        The task will be added to the shared queue and picked up by
-        an available reader. Readers use work-stealing for load balancing.
+        The task will be picked up by the first available reader.
 
         Args:
             func: Function to execute. First argument will be the connection.
@@ -349,10 +290,7 @@ class ThreadPool:
             task_type=TaskType.READ,
         )
 
-        with self._shared_read_lock:
-            self._shared_read_queue.append(task)
-        self._reader_event.set()
-
+        self._reader_queue.put(task)
         return future
 
     def submit(
@@ -419,19 +357,18 @@ class ThreadPool:
             return
 
         self._closed = True
-        self._shutdown_event.set()
+        self._shutdown = True
 
-        # Wake up all threads
-        self._writer_event.set()
-        self._reader_event.set()
+        # Send shutdown signals
+        self._writer_queue.put(None)
+        self._reader_queue.put(None)  # One None will cascade to all readers
 
         if wait:
             if self._writer_thread:
                 self._writer_thread.join(timeout=5.0)
 
-            for state in self._readers:
-                if state.thread:
-                    state.thread.join(timeout=5.0)
+            for thread in self._reader_threads:
+                thread.join(timeout=5.0)
 
     def __enter__(self) -> "ThreadPool":
         return self

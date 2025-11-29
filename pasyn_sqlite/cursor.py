@@ -120,10 +120,8 @@ class Cursor:
                 self._execute_in_thread, sql, parameters, is_read
             )
 
-        loop = asyncio.get_event_loop()
-        rows, description, rowcount, lastrowid = await loop.run_in_executor(
-            None, future.result
-        )
+        # Use wrap_future for efficient async waiting without blocking executor threads
+        rows, description, rowcount, lastrowid = await asyncio.wrap_future(future)
 
         self._rows = rows
         self._row_index = 0
@@ -155,8 +153,7 @@ class Cursor:
             self._executemany_in_thread, sql, parameters
         )
 
-        loop = asyncio.get_event_loop()
-        rowcount, lastrowid = await loop.run_in_executor(None, future.result)
+        rowcount, lastrowid = await asyncio.wrap_future(future)
 
         self._rows = []
         self._row_index = 0
@@ -181,8 +178,7 @@ class Cursor:
         pool = self._connection._pool
         future = pool.submit_write(self._executescript_in_thread, script)
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, future.result)
+        await asyncio.wrap_future(future)
 
         self._rows = []
         self._row_index = 0

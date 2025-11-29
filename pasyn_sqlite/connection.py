@@ -189,16 +189,14 @@ class Connection:
         self._check_closed()
 
         future = self._pool.submit_write(self._commit_in_thread)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, future.result)
+        await asyncio.wrap_future(future)
 
     async def rollback(self) -> None:
         """Rollback the current transaction."""
         self._check_closed()
 
         future = self._pool.submit_write(self._rollback_in_thread)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, future.result)
+        await asyncio.wrap_future(future)
 
     async def close(self) -> None:
         """Close the connection and the thread pool."""
@@ -231,8 +229,7 @@ class Connection:
         future = self._pool.submit_write(
             self._create_function_in_thread, name, num_params, func, deterministic
         )
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, future.result)
+        await asyncio.wrap_future(future)
 
     async def set_trace_callback(
         self, callback: Callable[[str], None] | None
@@ -248,8 +245,7 @@ class Connection:
         future = self._pool.submit_write(
             self._set_trace_callback_in_thread, callback
         )
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, future.result)
+        await asyncio.wrap_future(future)
 
     @property
     def closed(self) -> bool:
