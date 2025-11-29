@@ -33,6 +33,7 @@ from implementations import (
     MainThreadSQLite,
     SingleThreadSQLite,
     PasynSQLite,
+    PasynPoolSQLite,
 )
 
 
@@ -612,6 +613,148 @@ class Benchmark:
             median_task_time_ms=statistics.median(task_times),
         )
 
+    # ==================== Transaction Benchmarks ====================
+
+    async def bench_transaction_simple(
+        self, impl: BaseSQLiteImplementation, impl_name: str
+    ) -> BenchmarkResult:
+        """Benchmark: Simple transaction with a few operations."""
+        counter = [0]
+
+        async def task() -> None:
+            counter[0] += 1
+            base_id = 1000000 + counter[0] * 10
+
+            async def ops(db: BaseSQLiteImplementation) -> None:
+                await db.execute(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    (base_id, f"TxUser{base_id}", f"tx{base_id}@test.com", 25),
+                )
+                await db.execute(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    (base_id + 1, f"TxUser{base_id + 1}", f"tx{base_id + 1}@test.com", 26),
+                )
+                await db.execute("SELECT * FROM users WHERE id = ?", (base_id,))
+
+            await impl.run_in_transaction(ops)
+
+        times = await self.run_timed(task, iterations=100)
+        return BenchmarkResult.from_times("transaction_simple", impl_name, times)
+
+    async def bench_transaction_batch(
+        self, impl: BaseSQLiteImplementation, impl_name: str
+    ) -> BenchmarkResult:
+        """Benchmark: Transaction with batch insert."""
+        counter = [0]
+
+        async def task() -> None:
+            counter[0] += 1
+            base_id = 2000000 + counter[0] * 100
+
+            async def ops(db: BaseSQLiteImplementation) -> None:
+                rows = [
+                    (base_id + i, f"BatchTx{base_id + i}", f"batchtx{base_id + i}@test.com", 30)
+                    for i in range(50)
+                ]
+                await db.executemany(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+                # Read to verify
+                await db.execute("SELECT COUNT(*) FROM users WHERE id >= ?", (base_id,))
+
+            await impl.run_in_transaction(ops)
+
+        times = await self.run_timed(task, iterations=50)
+        return BenchmarkResult.from_times("transaction_batch", impl_name, times)
+
+    async def bench_concurrent_transactions(
+        self, impl: BaseSQLiteImplementation, impl_name: str
+    ) -> WorkloadResult:
+        """Benchmark: Many concurrent transactions (serialized)."""
+        num_tasks = 20
+        task_results: list[TaskResult] = []
+
+        async def tx_task(task_id: int) -> TaskResult:
+            start = time.perf_counter()
+            base_id = 3000000 + task_id * 10
+
+            async def ops(db: BaseSQLiteImplementation) -> None:
+                await db.execute(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    (base_id, f"ConcTx{base_id}", f"conctx{base_id}@test.com", 25),
+                )
+                await db.execute(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    (base_id + 1, f"ConcTx{base_id + 1}", f"conctx{base_id + 1}@test.com", 26),
+                )
+                await db.execute("SELECT * FROM users WHERE id >= ?", (base_id,))
+                await db.execute(
+                    "UPDATE users SET age = age + 1 WHERE id = ?", (base_id,)
+                )
+
+            await impl.run_in_transaction(ops)
+            end = time.perf_counter()
+            return TaskResult(
+                task_id=task_id,
+                start_time=start,
+                end_time=end,
+                duration_ms=(end - start) * 1000,
+            )
+
+        overall_start = time.perf_counter()
+        task_results = await asyncio.gather(*[tx_task(i) for i in range(num_tasks)])
+        overall_end = time.perf_counter()
+
+        total_time_ms = (overall_end - overall_start) * 1000
+        task_times = [t.duration_ms for t in task_results]
+
+        return WorkloadResult(
+            name="concurrent_transactions",
+            implementation=impl_name,
+            total_time_ms=total_time_ms,
+            task_results=list(task_results),
+            tasks_per_second=num_tasks / (total_time_ms / 1000),
+            mean_task_time_ms=statistics.mean(task_times),
+            median_task_time_ms=statistics.median(task_times),
+        )
+
+    async def bench_transaction_with_reads(
+        self, impl: BaseSQLiteImplementation, impl_name: str
+    ) -> BenchmarkResult:
+        """Benchmark: Transaction with multiple reads and writes."""
+        counter = [0]
+
+        async def task() -> None:
+            counter[0] += 1
+            base_id = 4000000 + counter[0] * 10
+
+            async def ops(db: BaseSQLiteImplementation) -> None:
+                # Read existing data
+                await db.execute("SELECT * FROM users WHERE age > ? LIMIT 10", (30,))
+
+                # Insert
+                await db.execute(
+                    "INSERT INTO users (id, name, email, age) VALUES (?, ?, ?, ?)",
+                    (base_id, f"TxRead{base_id}", f"txread{base_id}@test.com", 35),
+                )
+
+                # Read our insert
+                await db.execute("SELECT * FROM users WHERE id = ?", (base_id,))
+
+                # Update based on read
+                await db.execute(
+                    "UPDATE users SET age = ? WHERE id = ?", (36, base_id)
+                )
+
+                # Verify update
+                await db.execute("SELECT age FROM users WHERE id = ?", (base_id,))
+
+            await impl.run_in_transaction(ops)
+
+        times = await self.run_timed(task, iterations=100)
+        return BenchmarkResult.from_times("transaction_with_reads", impl_name, times)
+
 
 def print_benchmark_results(results: list[BenchmarkResult]) -> None:
     """Print benchmark results in a formatted table."""
@@ -698,7 +841,7 @@ async def run_all_benchmarks() -> None:
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
         ("pasyn_3readers", PasynSQLite(num_readers=3)),
-        ("pasyn_5readers", PasynSQLite(num_readers=5)),
+        ("pasyn_pool_3readers", PasynPoolSQLite(num_readers=3)),
     ]
 
     all_results: dict[str, list[BenchmarkResult | WorkloadResult]] = {}
@@ -764,6 +907,36 @@ async def run_all_benchmarks() -> None:
                     all_results[name] = []
                 all_results[name].append(result)
 
+            # Run transaction benchmarks
+            transaction_benchmarks = [
+                ("transaction_simple", bench.bench_transaction_simple),
+                ("transaction_batch", bench.bench_transaction_batch),
+                ("transaction_with_reads", bench.bench_transaction_with_reads),
+            ]
+
+            for name, benchmark_func in transaction_benchmarks:
+                print(f"  Running {name}...", end=" ", flush=True)
+                result = await benchmark_func(impl, impl_name)
+                print(f"done ({result.mean_time_ms:.3f}ms mean)")
+
+                if name not in all_results:
+                    all_results[name] = []
+                all_results[name].append(result)
+
+            # Run concurrent transactions workload
+            transaction_workloads = [
+                ("concurrent_transactions", bench.bench_concurrent_transactions),
+            ]
+
+            for name, benchmark_func in transaction_workloads:
+                print(f"  Running {name}...", end=" ", flush=True)
+                result = await benchmark_func(impl, impl_name)
+                print(f"done ({result.total_time_ms:.2f}ms total)")
+
+                if name not in all_results:
+                    all_results[name] = []
+                all_results[name].append(result)
+
             await impl.close()
 
         finally:
@@ -788,11 +961,19 @@ async def run_all_benchmarks() -> None:
         if name in all_results:
             print_benchmark_results(all_results[name])  # type: ignore
 
+    # Transaction benchmarks
+    transaction_names = [
+        "transaction_simple", "transaction_batch", "transaction_with_reads",
+    ]
+    for name in transaction_names:
+        if name in all_results:
+            print_benchmark_results(all_results[name])  # type: ignore
+
     # Workload benchmarks
     workload_names = [
         "concurrent_reads", "concurrent_writes",
         "mixed_workload", "heavy_read_workload",
-        "db_with_io_simulation",
+        "db_with_io_simulation", "concurrent_transactions",
     ]
     for name in workload_names:
         if name in all_results:
