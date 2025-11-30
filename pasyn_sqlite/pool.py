@@ -2,6 +2,7 @@
 Thread pool with Single Writer Multiple Reader (SWMR) architecture.
 
 Uses blocking Queue.get() for zero-polling, efficient thread coordination.
+Each reader has its own queue to eliminate lock contention.
 """
 
 from __future__ import annotations
@@ -45,7 +46,8 @@ class ThreadPool:
     - Single writer thread: Handles all write operations (INSERT, UPDATE, etc.)
     - Reader thread(s): Handle SELECT queries
 
-    Uses blocking Queue.get() - no polling, zero CPU waste when idle.
+    Uses separate queue per reader to eliminate lock contention.
+    Tasks are distributed round-robin to reader queues.
     """
 
     # SQL keywords that indicate write operations
@@ -107,8 +109,11 @@ class ThreadPool:
         # Write queue - blocking Queue, no polling
         self._write_queue: Queue[Task | None] = Queue()
 
-        # Read queue - blocking Queue for reader(s)
-        self._read_queue: Queue[Task | None] = Queue()
+        # Separate queue per reader - eliminates lock contention!
+        self._reader_queues: list[Queue[Task | None]] = [
+            Queue() for _ in range(num_readers)
+        ]
+        self._next_reader = 0  # Round-robin counter
 
         # Writer thread
         self._writer_thread: threading.Thread | None = None
@@ -131,11 +136,11 @@ class ThreadPool:
         )
         self._writer_thread.start()
 
-        # Start reader threads
+        # Start reader threads, each with its own queue
         for i in range(self._num_readers):
             thread = threading.Thread(
                 target=self._reader_loop,
-                args=(i,),
+                args=(i, self._reader_queues[i]),
                 name=f"pasyn-sqlite-reader-{i}",
                 daemon=True,
             )
@@ -183,8 +188,8 @@ class ThreadPool:
         if self._writer_connection:
             self._writer_connection.close()
 
-    def _reader_loop(self, reader_id: int) -> None:
-        """Main loop for a reader thread."""
+    def _reader_loop(self, reader_id: int, queue: Queue[Task | None]) -> None:
+        """Main loop for a reader thread with its own dedicated queue."""
         # Wait for writer to establish WAL mode
         self._writer_ready.wait(timeout=5.0)
 
@@ -192,11 +197,9 @@ class ThreadPool:
         self._reader_connections.append(conn)
 
         while True:
-            # Blocks until task available - no polling!
-            task = self._read_queue.get()
+            # Blocks on own queue - no contention with other readers!
+            task = queue.get()
             if task is None:  # Shutdown sentinel
-                # Re-queue None for other readers
-                self._read_queue.put(None)
                 break
             self._execute_task(task, conn)
 
@@ -241,7 +244,7 @@ class ThreadPool:
         *args: Any,
         **kwargs: Any,
     ) -> Future[T]:
-        """Submit a read task to the reader thread(s)."""
+        """Submit a read task to a reader thread (round-robin)."""
         if self._closed:
             raise PoolClosedError("Pool is closed")
 
@@ -254,7 +257,11 @@ class ThreadPool:
             task_type=TaskType.READ,
         )
 
-        self._read_queue.put(task)
+        # Round-robin distribution to reader queues
+        queue = self._reader_queues[self._next_reader]
+        self._next_reader = (self._next_reader + 1) % self._num_readers
+        queue.put(task)
+
         return future
 
     def submit(
@@ -291,7 +298,8 @@ class ThreadPool:
 
         # Send shutdown sentinels
         self._write_queue.put(None)
-        self._read_queue.put(None)
+        for queue in self._reader_queues:
+            queue.put(None)
 
         if wait:
             if self._writer_thread:
