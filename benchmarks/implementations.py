@@ -6,9 +6,9 @@ import asyncio
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
-from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from queue import Queue
 from typing import Any, Callable, Coroutine, Sequence
 
 import pasyn_sqlite
@@ -121,14 +121,12 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
     SQLite running in a single background thread.
 
     All operations (reads and writes) go through one thread.
-    Uses lock-free queue operations (GIL-atomic deque).
+    Uses blocking Queue.get() - no polling, zero CPU waste when idle.
     """
 
     def __init__(self) -> None:
         self._conn: sqlite3.Connection | None = None
-        self._queue: deque[DBTask] = deque()
-        self._event = threading.Event()
-        self._shutdown = threading.Event()
+        self._queue: Queue[DBTask | None] = Queue()
         self._thread: threading.Thread | None = None
         self._tx_lock: asyncio.Lock | None = None  # For serializing transactions
 
@@ -147,19 +145,16 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
-        while not self._shutdown.is_set():
-            # Lock-free: deque.popleft() is GIL-atomic
+        while True:
+            # Blocks until task available - no polling!
+            task = self._queue.get()
+            if task is None:  # Shutdown sentinel
+                break
             try:
-                task = self._queue.popleft()
-                try:
-                    result = task.func(self._conn)
-                    task.future.set_result(result)
-                except Exception as e:
-                    task.future.set_exception(e)
-            except IndexError:
-                # Queue empty - wait with short timeout for responsiveness
-                self._event.wait(timeout=0.01)
-                self._event.clear()
+                result = task.func(self._conn)
+                task.future.set_result(result)
+            except Exception as e:
+                task.future.set_exception(e)
 
         if self._conn:
             self._conn.close()
@@ -167,11 +162,7 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
     async def _submit(self, func: Callable[[sqlite3.Connection], Any]) -> Any:
         future: Future[Any] = Future()
         task = DBTask(func=func, args=(), future=future)
-
-        # Lock-free: deque.append() is GIL-atomic
-        self._queue.append(task)
-        self._event.set()
-
+        self._queue.put(task)
         return await asyncio.wrap_future(future)
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
@@ -207,8 +198,7 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
                 raise
 
     async def close(self) -> None:
-        self._shutdown.set()
-        self._event.set()
+        self._queue.put(None)  # Send shutdown sentinel
         if self._thread:
             self._thread.join(timeout=5.0)
 
