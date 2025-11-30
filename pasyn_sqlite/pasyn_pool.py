@@ -346,7 +346,7 @@ class PasynPool:
     def __init__(
         self,
         database: str,
-        num_readers: int = 3,
+        num_readers: int = 1,
         **sqlite_kwargs: Any,
     ) -> None:
         self._database = database
@@ -505,7 +505,7 @@ class PasynPool:
 async def create_pool(
     database: str,
     *,
-    num_readers: int = 3,
+    num_readers: int = 1,
     **sqlite_kwargs: Any,
 ) -> PasynPool:
     """
@@ -513,7 +513,7 @@ async def create_pool(
 
     Args:
         database: Path to SQLite database or ":memory:".
-        num_readers: Number of reader threads (default: 3).
+        num_readers: Number of reader threads (default: 1).
         **sqlite_kwargs: Additional arguments passed to sqlite3.connect().
 
     Returns:

@@ -25,7 +25,7 @@ class TestPasynPool:
         """Test pool creation."""
         pool = await create_pool(":memory:")
         assert not pool.closed
-        assert pool.num_readers == 3
+        assert pool.num_readers == 1
         await pool.close()
         assert pool.closed
 
