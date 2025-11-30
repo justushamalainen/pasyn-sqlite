@@ -839,7 +839,7 @@ async def run_all_benchmarks() -> None:
     implementations = [
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
-        ("pasyn_pool_3readers", PasynPoolSQLite(num_readers=3)),
+        ("pasyn_pool", PasynPoolSQLite(num_readers=1)),
     ]
 
     all_results: dict[str, list[BenchmarkResult | WorkloadResult]] = {}
