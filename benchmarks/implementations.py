@@ -121,12 +121,12 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
     SQLite running in a single background thread.
 
     All operations (reads and writes) go through one thread.
+    Uses lock-free queue operations (GIL-atomic deque).
     """
 
     def __init__(self) -> None:
         self._conn: sqlite3.Connection | None = None
         self._queue: deque[DBTask] = deque()
-        self._lock = threading.Lock()
         self._event = threading.Event()
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
@@ -148,19 +148,17 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         self._conn.execute("PRAGMA busy_timeout=5000")
 
         while not self._shutdown.is_set():
-            task = None
-            with self._lock:
-                if self._queue:
-                    task = self._queue.popleft()
-
-            if task is not None:
+            # Lock-free: deque.popleft() is GIL-atomic
+            try:
+                task = self._queue.popleft()
                 try:
                     result = task.func(self._conn)
                     task.future.set_result(result)
                 except Exception as e:
                     task.future.set_exception(e)
-            else:
-                self._event.wait(timeout=0.1)
+            except IndexError:
+                # Queue empty - wait with short timeout for responsiveness
+                self._event.wait(timeout=0.01)
                 self._event.clear()
 
         if self._conn:
@@ -170,8 +168,8 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         future: Future[Any] = Future()
         task = DBTask(func=func, args=(), future=future)
 
-        with self._lock:
-            self._queue.append(task)
+        # Lock-free: deque.append() is GIL-atomic
+        self._queue.append(task)
         self._event.set()
 
         return await asyncio.wrap_future(future)
