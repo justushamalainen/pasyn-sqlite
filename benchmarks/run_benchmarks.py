@@ -32,7 +32,6 @@ from implementations import (
     BaseSQLiteImplementation,
     MainThreadSQLite,
     SingleThreadSQLite,
-    PasynSQLite,
     PasynPoolSQLite,
 )
 
@@ -840,7 +839,6 @@ async def run_all_benchmarks() -> None:
     implementations = [
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
-        ("pasyn_3readers", PasynSQLite(num_readers=3)),
         ("pasyn_pool_3readers", PasynPoolSQLite(num_readers=3)),
     ]
 

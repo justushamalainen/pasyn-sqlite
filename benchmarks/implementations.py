@@ -215,60 +215,9 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
             self._thread.join(timeout=5.0)
 
 
-class PasynSQLite(BaseSQLiteImplementation):
-    """
-    Legacy implementation using pasyn_sqlite.connect() API.
-    """
-
-    def __init__(self, num_readers: int = 3) -> None:
-        self._num_readers = num_readers
-        self._conn: pasyn_sqlite.Connection | None = None
-        self._tx_lock: asyncio.Lock | None = None
-
-    async def setup(self, db_path: str) -> None:
-        self._tx_lock = asyncio.Lock()
-        self._conn = await pasyn_sqlite.connect(
-            db_path, num_readers=self._num_readers
-        )
-
-    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
-        assert self._conn is not None
-        cursor = await self._conn.execute(sql, parameters)
-        return await cursor.fetchall()
-
-    async def executemany(
-        self, sql: str, parameters: Sequence[Sequence[Any]]
-    ) -> None:
-        assert self._conn is not None
-        await self._conn.executemany(sql, parameters)
-
-    async def commit(self) -> None:
-        assert self._conn is not None
-        await self._conn.commit()
-
-    async def run_in_transaction(
-        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
-    ) -> None:
-        """Run operations within a transaction - serialized with lock."""
-        assert self._tx_lock is not None
-        async with self._tx_lock:
-            await self.begin_transaction()
-            try:
-                await operations(self)
-                await self.commit()
-            except Exception:
-                await self.rollback()
-                raise
-
-    async def close(self) -> None:
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
-
-
 class PasynPoolSQLite(BaseSQLiteImplementation):
     """
-    New PasynPool implementation with bound_connection for transactions.
+    PasynPool implementation with bound_connection for transactions.
 
     Uses:
     - pool.execute() for simple queries (auto-routes, auto-commits)
@@ -364,7 +313,6 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     implementations = {
         "main_thread": MainThreadSQLite,
         "single_thread": SingleThreadSQLite,
-        "pasyn": PasynSQLite,
         "pasyn_pool": PasynPoolSQLite,
     }
     if name not in implementations:

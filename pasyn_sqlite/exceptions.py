@@ -40,19 +40,7 @@ class TransactionError(PoolError):
     pass
 
 
-class TransactionAlreadyActiveError(TransactionError):
-    """Raised when starting a transaction while one is already active."""
-
-    pass
-
-
-class NoActiveTransactionError(TransactionError):
-    """Raised when committing/rolling back without an active transaction."""
-
-    pass
-
-
-class TransactionCommandError(PoolError):
+class TransactionCommandError(TransactionError):
     """Raised when transaction commands are used on Pool (use bound_connection instead)."""
 
     pass

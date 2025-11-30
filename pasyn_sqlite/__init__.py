@@ -29,7 +29,7 @@ Example:
         print(rows)
 
         # Transactions - use bound_connection
-        async with pool.bound_connection() as conn:
+        async with await pool.bound_connection() as conn:
             await conn.execute("BEGIN")
             await conn.execute("INSERT INTO users (name) VALUES (?)", ("Bob",))
             await conn.execute("INSERT INTO users (name) VALUES (?)", ("Charlie",))
@@ -40,16 +40,13 @@ Example:
     asyncio.run(main())
 """
 
-# New Pool API
+# Pool API
 from .pasyn_pool import (
     BoundConnection,
     Cursor,
     PasynPool,
     create_pool,
 )
-
-# Legacy API (kept for compatibility)
-from .connection import Connection, connect
 
 from .exceptions import (
     ConnectionClosedError,
@@ -59,44 +56,31 @@ from .exceptions import (
     IntegrityError,
     InterfaceError,
     InternalError,
-    NoActiveTransactionError,
     NotSupportedError,
     OperationalError,
     PoolClosedError,
     PoolError,
     ProgrammingError,
-    TransactionAlreadyActiveError,
     TransactionCommandError,
     TransactionError,
     Warning,
 )
 from .pool import ThreadPool
-from .transactions import IsolationLevel, Savepoint, Transaction, TransactionContext
 
 __version__ = "0.1.0"
 
 __all__ = [
-    # New Pool API
+    # Pool API
     "create_pool",
     "PasynPool",
     "BoundConnection",
     "Cursor",
-    # Legacy API
-    "connect",
-    "Connection",
     "ThreadPool",
-    # Transactions (legacy)
-    "Transaction",
-    "TransactionContext",
-    "Savepoint",
-    "IsolationLevel",
     # Exceptions
     "PoolError",
     "PoolClosedError",
     "ConnectionClosedError",
     "TransactionError",
-    "TransactionAlreadyActiveError",
-    "NoActiveTransactionError",
     "TransactionCommandError",
     # Re-exported sqlite3 exceptions
     "Error",
