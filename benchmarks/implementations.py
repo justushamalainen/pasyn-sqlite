@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from queue import Queue
 from typing import Any, Callable, Coroutine, Sequence
 
+import aiosqlite
 import pasyn_sqlite
 
 
@@ -295,6 +296,60 @@ class BoundConnectionWrapper(BaseSQLiteImplementation):
         pass  # Managed by context manager
 
 
+class AioSQLite(BaseSQLiteImplementation):
+    """
+    aiosqlite implementation.
+
+    Uses aiosqlite library - a popular async wrapper for sqlite3.
+    Internally uses a single dedicated thread for all database operations.
+    """
+
+    def __init__(self) -> None:
+        self._conn: aiosqlite.Connection | None = None
+        self._tx_lock: asyncio.Lock | None = None
+
+    async def setup(self, db_path: str) -> None:
+        self._conn = await aiosqlite.connect(db_path)
+        self._tx_lock = asyncio.Lock()
+        # Set pragmas for consistency with other implementations
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._conn is not None
+        cursor = await self._conn.execute(sql, parameters)
+        return await cursor.fetchall()
+
+    async def executemany(
+        self, sql: str, parameters: Sequence[Sequence[Any]]
+    ) -> None:
+        assert self._conn is not None
+        await self._conn.executemany(sql, parameters)
+
+    async def commit(self) -> None:
+        assert self._conn is not None
+        await self._conn.commit()
+
+    async def run_in_transaction(
+        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+    ) -> None:
+        """Run operations within a transaction - serialized with lock."""
+        assert self._tx_lock is not None
+        async with self._tx_lock:
+            await self.begin_transaction()
+            try:
+                await operations(self)
+                await self.commit()
+            except Exception:
+                await self.rollback()
+                raise
+
+    async def close(self) -> None:
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+
+
 # Factory function
 def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
@@ -302,6 +357,7 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
         "main_thread": MainThreadSQLite,
         "single_thread": SingleThreadSQLite,
         "pasyn_pool": PasynPoolSQLite,
+        "aiosqlite": AioSQLite,
     }
     if name not in implementations:
         raise ValueError(f"Unknown implementation: {name}")

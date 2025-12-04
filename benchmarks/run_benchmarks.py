@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Coroutine, Any
 
 from implementations import (
+    AioSQLite,
     BaseSQLiteImplementation,
     MainThreadSQLite,
     SingleThreadSQLite,
@@ -839,6 +840,7 @@ async def run_all_benchmarks() -> None:
     implementations = [
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
+        ("aiosqlite", AioSQLite()),
         ("pasyn_pool_1r", PasynPoolSQLite(num_readers=1)),
         ("pasyn_pool_2r", PasynPoolSQLite(num_readers=2)),
         ("pasyn_pool_4r", PasynPoolSQLite(num_readers=4)),
