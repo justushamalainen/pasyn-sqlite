@@ -310,6 +310,7 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
         self._server: pasyn_sqlite_core.WriterServerHandle | None = None
         self._conn: pasyn_sqlite_core.NativeHybridConnection | None = None
         self._db_path: str | None = None
+        self._in_transaction: bool = False
 
     async def setup(self, db_path: str) -> None:
         self._db_path = db_path
@@ -341,15 +342,20 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
 
     async def commit(self) -> None:
         assert self._conn is not None
-        await self._conn.write_commit()
+        if self._in_transaction:
+            await self._conn.write_commit()
+            self._in_transaction = False
 
     async def begin_transaction(self) -> None:
         assert self._conn is not None
         await self._conn.write_begin()
+        self._in_transaction = True
 
     async def rollback(self) -> None:
         assert self._conn is not None
-        await self._conn.write_rollback()
+        if self._in_transaction:
+            await self._conn.write_rollback()
+            self._in_transaction = False
 
     async def run_in_transaction(
         self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
