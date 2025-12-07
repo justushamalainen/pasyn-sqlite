@@ -1151,6 +1151,249 @@ fn native_async_client(socket_path: &str) -> PyNativeAsyncClient {
     PyNativeAsyncClient::new(socket_path)
 }
 
+// =============================================================================
+// Persistent Native Awaitable Client - uses a single persistent connection
+// =============================================================================
+
+/// Shared socket connection with reader and writer.
+struct SocketConnection {
+    reader: BufReader<UnixStream>,
+    writer: BufWriter<UnixStream>,
+}
+
+/// Native awaitable for execute operations using a persistent connection.
+#[pyclass]
+pub struct PersistentNativeExecuteAwaitable {
+    connection: Arc<Mutex<Option<SocketConnection>>>,
+    request_bytes: Vec<u8>,
+    completed: bool,
+    result: Option<(bool, i64, i64, Option<String>)>,
+}
+
+#[pymethods]
+impl PersistentNativeExecuteAwaitable {
+    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if slf.completed {
+            if let Some(result) = slf.result.take() {
+                let result_obj = result.to_object(py);
+                return Err(make_stop_iteration(py, result_obj));
+            }
+            return Err(PyStopIteration::new_err(py.None()));
+        }
+
+        let connection = slf.connection.clone();
+        let request_bytes = slf.request_bytes.clone();
+
+        // Lock connection, release GIL, do I/O
+        let result = py.allow_threads(move || {
+            let mut conn_guard = connection.lock().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Lock poisoned")
+            })?;
+
+            let conn = conn_guard.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "Connection closed")
+            })?;
+
+            use std::io::Write;
+            conn.writer.write_all(&request_bytes)?;
+            conn.writer.flush()?;
+
+            let response_data = read_message(&mut conn.reader)?;
+            let response = Response::deserialize(&response_data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+
+            Ok::<_, std::io::Error>((
+                response.is_ok(),
+                response.rows_affected,
+                response.last_insert_rowid,
+                response.error_message,
+            ))
+        });
+
+        slf.completed = true;
+
+        match result {
+            Ok(result) => {
+                slf.result = Some(result.clone());
+                let result_obj = result.to_object(py);
+                Err(make_stop_iteration(py, result_obj))
+            }
+            Err(e) => Err(PyRuntimeError::new_err(format!("Socket error: {}", e))),
+        }
+    }
+}
+
+/// Persistent native async client that reuses a single socket connection.
+///
+/// This is more efficient than NativeAsyncClient for multiple operations
+/// because it doesn't create a new connection for each request.
+#[pyclass(name = "PersistentNativeAsyncClient")]
+pub struct PyPersistentNativeAsyncClient {
+    connection: Arc<Mutex<Option<SocketConnection>>>,
+}
+
+#[pymethods]
+impl PyPersistentNativeAsyncClient {
+    #[new]
+    fn new(socket_path: &str) -> PyResult<Self> {
+        let stream = UnixStream::connect(socket_path).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to connect: {}", e))
+        })?;
+        let reader = BufReader::new(stream.try_clone().map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to clone stream: {}", e))
+        })?);
+        let writer = BufWriter::new(stream);
+
+        Ok(PyPersistentNativeAsyncClient {
+            connection: Arc::new(Mutex::new(Some(SocketConnection { reader, writer }))),
+        })
+    }
+
+    /// Execute a SQL statement asynchronously (returns awaitable).
+    #[pyo3(signature = (sql, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<PersistentNativeExecuteAwaitable> {
+        let params = extract_params(py, params)?;
+        let request = Request::execute(sql, params);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        Ok(PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        })
+    }
+
+    /// Execute a SQL statement and return the last insert rowid (returns awaitable).
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<PersistentNativeExecuteAwaitable> {
+        let params = extract_params(py, params)?;
+        let request = Request::execute_returning_rowid(sql, params);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        Ok(PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        })
+    }
+
+    /// Execute multiple SQL statements (returns awaitable).
+    fn executescript(&self, sql: &str) -> PersistentNativeExecuteAwaitable {
+        let request = Request::execute_batch(sql);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Begin a transaction (returns awaitable).
+    fn begin(&self) -> PersistentNativeExecuteAwaitable {
+        let request = Request::begin_transaction();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Commit the current transaction (returns awaitable).
+    fn commit(&self) -> PersistentNativeExecuteAwaitable {
+        let request = Request::commit();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Rollback the current transaction (returns awaitable).
+    fn rollback(&self) -> PersistentNativeExecuteAwaitable {
+        let request = Request::rollback();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Ping the server (returns awaitable).
+    fn ping(&self) -> PersistentNativeExecuteAwaitable {
+        let request = Request::ping();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Close the connection.
+    fn close(&self) -> PyResult<()> {
+        let mut conn_guard = self.connection.lock().map_err(|_| {
+            PyRuntimeError::new_err("Lock poisoned")
+        })?;
+        // Take the connection, dropping it will close the socket
+        *conn_guard = None;
+        Ok(())
+    }
+}
+
+/// Create a persistent native async client (convenience function).
+#[pyfunction]
+fn persistent_native_async_client(socket_path: &str) -> PyResult<PyPersistentNativeAsyncClient> {
+    PyPersistentNativeAsyncClient::new(socket_path)
+}
+
 /// Python module
 #[pymodule]
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1167,6 +1410,8 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Native async client classes
     m.add_class::<PyNativeAsyncClient>()?;
     m.add_class::<NativeExecuteAwaitable>()?;
+    m.add_class::<PyPersistentNativeAsyncClient>()?;
+    m.add_class::<PersistentNativeExecuteAwaitable>()?;
 
     // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;
@@ -1176,6 +1421,7 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_writer_server, m)?)?;
     m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
     m.add_function(wrap_pyfunction!(native_async_client, m)?)?;
+    m.add_function(wrap_pyfunction!(persistent_native_async_client, m)?)?;
 
     // Protocol serialization functions (for async I/O)
     m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;

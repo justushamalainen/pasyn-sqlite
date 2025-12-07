@@ -93,6 +93,10 @@ from .pasyn_sqlite_core import (
     NativeAsyncClient,
     NativeExecuteAwaitable,
     native_async_client,
+    # Persistent native async client (reuses connection)
+    PersistentNativeAsyncClient,
+    PersistentNativeExecuteAwaitable,
+    persistent_native_async_client,
     # Connection functions
     connect,
     hybrid_connect,
@@ -132,6 +136,8 @@ class NativeHybridConnection:
 
     This is similar to AsyncHybridConnection but uses native Rust awaitables
     instead of Python's asyncio socket operations.
+
+    Uses a persistent socket connection for better performance.
     """
 
     def __init__(self, database_path: str, socket_path: str):
@@ -144,12 +150,15 @@ class NativeHybridConnection:
         """
         # Open read-only connection for local reads
         self._read_conn = Connection(database_path, OpenFlags.readonly())
-        # Create native async client for writes
-        self._write_client = NativeAsyncClient(socket_path)
+        # Create persistent native async client for writes (reuses connection)
+        self._write_client = PersistentNativeAsyncClient(socket_path)
         self._socket_path = socket_path
 
     def close(self) -> None:
-        """Close the read connection."""
+        """Close all connections."""
+        if self._write_client:
+            self._write_client.close()
+            self._write_client = None
         if self._read_conn:
             self._read_conn.close()
             self._read_conn = None
@@ -513,6 +522,10 @@ __all__ = [
     "NativeAsyncClient",
     "NativeExecuteAwaitable",
     "NativeHybridConnection",
+    # Persistent native async classes (reuses connection)
+    "PersistentNativeAsyncClient",
+    "PersistentNativeExecuteAwaitable",
+    "persistent_native_async_client",
     # Async classes (asyncio socket I/O)
     "AsyncHybridConnection",
     "AsyncWriterClient",
