@@ -308,7 +308,8 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
 
     def __init__(self) -> None:
         self._server: pasyn_sqlite_core.WriterServerHandle | None = None
-        self._conn: pasyn_sqlite_core.NativeHybridConnection | None = None
+        self._write_client: pasyn_sqlite_core.PersistentNativeAsyncClient | None = None
+        self._read_conn: pasyn_sqlite_core.Connection | None = None
         self._db_path: str | None = None
         self._in_transaction: bool = False
 
@@ -316,46 +317,68 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
         self._db_path = db_path
         # Start writer server
         self._server = pasyn_sqlite_core.start_writer_server(db_path)
-        # Create native hybrid connection
-        self._conn = pasyn_sqlite_core.native_hybrid_connect(
-            db_path, self._server.socket_path
+        # Create native async client for writes (returns awaitables)
+        self._write_client = pasyn_sqlite_core.persistent_native_async_client(
+            self._server.socket_path
+        )
+        # Create local read-only connection for reads
+        self._read_conn = pasyn_sqlite_core.connect(
+            db_path, pasyn_sqlite_core.OpenFlags.readonly()
         )
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
-        assert self._conn is not None
+        assert self._write_client is not None
+        assert self._read_conn is not None
         sql_lower = sql.strip().upper()
         if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
             # Read operation - use local connection (sync)
-            return self._conn.query_fetchall(sql, list(parameters))
+            return self._read_conn.execute_fetchall(sql, list(parameters))
         else:
-            # Write operation - use native awaitable
-            await self._conn.write_execute(sql, list(parameters))
+            # Write operation - use native awaitable (releases GIL)
+            await self._write_client.execute(sql, list(parameters))
             return []
 
     async def executemany(
         self, sql: str, parameters: Sequence[Sequence[Any]]
     ) -> None:
-        assert self._conn is not None
-        # Execute each set of parameters as a separate write
+        assert self._write_client is not None
+        # Use executescript to run all inserts in a single transaction
+        # This is more efficient than individual execute calls
+        # The server wraps execute_many in a transaction automatically
+        if not parameters:
+            return
+        # Execute each set of parameters - server auto-commits each
+        # For efficiency in transactions, use run_in_transaction
         for params in parameters:
-            await self._conn.write_execute(sql, list(params))
+            await self._write_client.execute(sql, list(params))
 
     async def commit(self) -> None:
-        assert self._conn is not None
+        assert self._write_client is not None
+        # Only send commit if in an explicit transaction
+        # (server auto-commits single statements, COMMIT fails if no transaction active)
         if self._in_transaction:
-            await self._conn.write_commit()
+            result = await self._write_client.commit()
+            # result is tuple: (success, rows_affected, last_insert_rowid, error_message)
+            if not result[0]:
+                raise RuntimeError(f"Commit failed: {result[3]}")
             self._in_transaction = False
+        # If not in transaction, commit is a no-op (already auto-committed)
 
     async def begin_transaction(self) -> None:
-        assert self._conn is not None
-        await self._conn.write_begin()
+        assert self._write_client is not None
+        result = await self._write_client.begin()
+        if not result[0]:
+            raise RuntimeError(f"Begin transaction failed: {result[3]}")
         self._in_transaction = True
 
     async def rollback(self) -> None:
-        assert self._conn is not None
+        assert self._write_client is not None
         if self._in_transaction:
-            await self._conn.write_rollback()
+            result = await self._write_client.rollback()
+            if not result[0]:
+                raise RuntimeError(f"Rollback failed: {result[3]}")
             self._in_transaction = False
+        # If not in transaction, rollback is a no-op
 
     async def run_in_transaction(
         self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
@@ -370,9 +393,12 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
             raise
 
     async def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        if self._write_client:
+            self._write_client.close()
+            self._write_client = None
+        if self._read_conn:
+            self._read_conn.close()
+            self._read_conn = None
         if self._server:
             self._server.stop()
             self._server = None
@@ -427,13 +453,17 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         assert self._client is not None
         # Use execute_many for efficient batched execution
         # This sends all parameters in a single request
+        # The server wraps this in a transaction automatically for efficiency
         self._client.execute_many(sql, [list(p) for p in parameters])
 
     async def commit(self) -> None:
         assert self._client is not None
+        # Only send commit if in an explicit transaction
+        # (server auto-commits single statements, COMMIT fails if no transaction active)
         if self._in_transaction:
             self._client.commit()
             self._in_transaction = False
+        # If not in transaction, commit is a no-op (already auto-committed)
 
     async def begin_transaction(self) -> None:
         assert self._client is not None
@@ -445,6 +475,7 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         if self._in_transaction:
             self._client.rollback()
             self._in_transaction = False
+        # If not in transaction, rollback is a no-op
 
     async def run_in_transaction(
         self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
