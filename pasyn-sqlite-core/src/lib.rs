@@ -68,6 +68,11 @@ pub mod ffi;
 pub mod statement;
 pub mod value;
 
+// Writer server architecture
+pub mod protocol;
+pub mod server;
+pub mod client;
+
 #[cfg(feature = "python")]
 pub mod python;
 
@@ -76,6 +81,10 @@ pub use connection::{Connection, FromColumn, OpenFlags, Row, Transaction};
 pub use error::{Error, ErrorCode, Result};
 pub use statement::{ColumnType, RowRef, Rows, Statement};
 pub use value::{Params, Value};
+
+// Server/client re-exports
+pub use server::{ServerConfig, ServerHandle, WriterServer};
+pub use client::{HybridConnection, WriterClient};
 
 /// Get the SQLite library version string
 pub fn sqlite_version() -> &'static str {

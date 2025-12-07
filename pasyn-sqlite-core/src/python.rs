@@ -11,8 +11,11 @@ use crate::connection::OpenFlags as RustOpenFlags;
 use crate::error::Error as RustError;
 use crate::statement::Statement as RustStatement;
 use crate::value::Value as RustValue;
+use crate::server::{ServerConfig, ServerHandle, WriterServer};
+use crate::client::{HybridConnection as RustHybridConnection, WriterClient as RustWriterClient};
 
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 // Custom exception for SQLite errors
 pyo3::create_exception!(pasyn_sqlite_core, SqliteError, PyException);
@@ -48,10 +51,10 @@ fn py_to_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RustValue> {
 fn value_to_py(py: Python<'_>, value: RustValue) -> PyObject {
     match value {
         RustValue::Null => py.None(),
-        RustValue::Integer(i) => i.into_pyobject(py).unwrap().into_any().unbind(),
-        RustValue::Real(f) => f.into_pyobject(py).unwrap().into_any().unbind(),
-        RustValue::Text(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
-        RustValue::Blob(b) => PyBytes::new(py, &b).into_any().unbind(),
+        RustValue::Integer(i) => i.to_object(py),
+        RustValue::Real(f) => f.to_object(py),
+        RustValue::Text(s) => s.to_object(py),
+        RustValue::Blob(b) => PyBytes::new_bound(py, &b).into_any().unbind(),
     }
 }
 
@@ -157,7 +160,7 @@ impl PyConnection {
     #[new]
     #[pyo3(signature = (path, flags=None))]
     fn new(path: &str, flags: Option<PyOpenFlags>) -> PyResult<Self> {
-        let flags = flags.map(|f| RustOpenFlags(f.flags)).unwrap_or_default();
+        let flags = flags.map(|f| RustOpenFlags::from_bits(f.flags)).unwrap_or_default();
         let conn = RustConnection::open_with_flags(path, flags).map_err(to_py_err)?;
         Ok(PyConnection {
             conn: Arc::new(Mutex::new(conn)),
@@ -218,10 +221,10 @@ impl PyConnection {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
                 .map(|i| value_to_py(py, stmt.column_value(i)))
                 .collect();
-            rows.push(PyTuple::new(py, &row_values)?.into_any().unbind());
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
         }
 
-        Ok(PyList::new(py, &rows)?.unbind())
+        Ok(PyList::new_bound(py, &rows).unbind())
     }
 
     /// Execute SQL and return the first row
@@ -240,7 +243,7 @@ impl PyConnection {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
                 .map(|i| value_to_py(py, stmt.column_value(i)))
                 .collect();
-            Ok(Some(PyTuple::new(py, &row_values)?.unbind()))
+            Ok(Some(PyTuple::new_bound(py, &row_values).unbind()))
         } else {
             Ok(None)
         }
@@ -385,10 +388,10 @@ impl PyCursor {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
                 .map(|i| value_to_py(py, stmt.column_value(i)))
                 .collect();
-            rows.push(PyTuple::new(py, &row_values)?.into_any().unbind());
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
         }
 
-        Ok(PyList::new(py, &rows)?.unbind())
+        Ok(PyList::new_bound(py, &rows).unbind())
     }
 
     /// Fetch the next row
@@ -404,7 +407,7 @@ impl PyCursor {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
                 .map(|i| value_to_py(py, stmt.column_value(i)))
                 .collect();
-            Ok(Some(PyTuple::new(py, &row_values)?.unbind()))
+            Ok(Some(PyTuple::new_bound(py, &row_values).unbind()))
         } else {
             Ok(None)
         }
@@ -428,11 +431,11 @@ impl PyCursor {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
                 .map(|i| value_to_py(py, stmt.column_value(i)))
                 .collect();
-            rows.push(PyTuple::new(py, &row_values)?.into_any().unbind());
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
             count += 1;
         }
 
-        Ok(PyList::new(py, &rows)?.unbind())
+        Ok(PyList::new_bound(py, &rows).unbind())
     }
 
     /// Get column names
@@ -442,10 +445,10 @@ impl PyCursor {
             .column_names
             .iter()
             .map(|name| {
-                PyTuple::new(
+                Ok(PyTuple::new_bound(
                     py,
                     &[
-                        name.clone().into_pyobject(py).unwrap().into_any().unbind(),
+                        name.clone().to_object(py),
                         py.None(),
                         py.None(),
                         py.None(),
@@ -453,11 +456,11 @@ impl PyCursor {
                         py.None(),
                         py.None(),
                     ],
-                ).map(|t| t.unbind())
+                ).unbind())
             })
             .collect::<PyResult<_>>()?;
 
-        Ok(PyList::new(py, &desc)?.unbind())
+        Ok(PyList::new_bound(py, &desc).unbind())
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -503,18 +506,331 @@ fn connect(path: &str, flags: Option<PyOpenFlags>) -> PyResult<PyConnection> {
     PyConnection::new(path, flags)
 }
 
+// =============================================================================
+// Writer Server and Client bindings
+// =============================================================================
+
+/// Handle to a running writer server
+#[pyclass(name = "WriterServerHandle")]
+pub struct PyWriterServerHandle {
+    handle: Option<ServerHandle>,
+    socket_path: PathBuf,
+}
+
+#[pymethods]
+impl PyWriterServerHandle {
+    /// Get the socket path
+    #[getter]
+    fn socket_path(&self) -> String {
+        self.socket_path.to_string_lossy().to_string()
+    }
+
+    /// Signal the server to shutdown
+    fn shutdown(&self) -> PyResult<()> {
+        if let Some(ref handle) = self.handle {
+            handle.shutdown();
+        }
+        Ok(())
+    }
+
+    /// Wait for the server to stop
+    fn join(&mut self) -> PyResult<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.join().map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to join server: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Shutdown and wait for the server to stop
+    fn stop(&mut self) -> PyResult<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.stop().map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to stop server: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Start a writer server that handles all write operations via Unix socket
+#[pyfunction]
+#[pyo3(signature = (database_path, socket_path=None))]
+fn start_writer_server(database_path: &str, socket_path: Option<&str>) -> PyResult<PyWriterServerHandle> {
+    let socket_path = socket_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ServerConfig::default_socket_path(database_path));
+
+    let server = WriterServer::new(database_path, &socket_path).map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to create server: {}", e))
+    })?;
+
+    let handle = server.spawn().map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to start server: {}", e))
+    })?;
+
+    // Give the server a moment to start
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    Ok(PyWriterServerHandle {
+        handle: Some(handle),
+        socket_path,
+    })
+}
+
+/// Get the default socket path for a database
+#[pyfunction]
+fn default_socket_path(database_path: &str) -> String {
+    ServerConfig::default_socket_path(database_path).to_string_lossy().to_string()
+}
+
+/// Client for sending write operations to the writer server
+#[pyclass(name = "WriterClient")]
+pub struct PyWriterClient {
+    client: Mutex<RustWriterClient>,
+}
+
+#[pymethods]
+impl PyWriterClient {
+    /// Connect to a writer server
+    #[new]
+    fn new(socket_path: &str) -> PyResult<Self> {
+        let client = RustWriterClient::connect(socket_path).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to connect to writer server: {}", e))
+        })?;
+        Ok(PyWriterClient {
+            client: Mutex::new(client),
+        })
+    }
+
+    /// Execute a SQL statement
+    #[pyo3(signature = (sql, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<usize> {
+        let params = extract_params(py, params)?;
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.execute(sql, params).map_err(to_py_err)
+    }
+
+    /// Execute a SQL statement and return the last insert rowid
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<i64> {
+        let params = extract_params(py, params)?;
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.execute_returning_rowid(sql, params).map_err(to_py_err)
+    }
+
+    /// Execute multiple SQL statements (batch)
+    fn executescript(&self, sql: &str) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.execute_batch(sql).map_err(to_py_err)
+    }
+
+    /// Begin a transaction
+    fn begin(&self) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.begin_transaction().map_err(to_py_err)
+    }
+
+    /// Commit the current transaction
+    fn commit(&self) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.commit().map_err(to_py_err)
+    }
+
+    /// Rollback the current transaction
+    fn rollback(&self) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.rollback().map_err(to_py_err)
+    }
+
+    /// Ping the server
+    fn ping(&self) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.ping().map_err(to_py_err)
+    }
+
+    /// Shutdown the server
+    fn shutdown_server(&self) -> PyResult<()> {
+        let mut client = self.client.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        client.shutdown().map_err(to_py_err)
+    }
+}
+
+/// A hybrid connection that reads locally and writes via the writer server
+///
+/// This is the recommended way to use the library for concurrent access:
+/// - Read operations are performed directly on a local read-only connection
+/// - Write operations are sent to the writer server via Unix socket
+#[pyclass(name = "HybridConnection")]
+pub struct PyHybridConnection {
+    hybrid: Mutex<RustHybridConnection>,
+}
+
+#[pymethods]
+impl PyHybridConnection {
+    /// Create a new hybrid connection
+    ///
+    /// - `database_path`: Path to the SQLite database
+    /// - `socket_path`: Path to the writer server Unix socket
+    #[new]
+    fn new(database_path: &str, socket_path: &str) -> PyResult<Self> {
+        let hybrid = RustHybridConnection::new(database_path, socket_path).map_err(to_py_err)?;
+        Ok(PyHybridConnection {
+            hybrid: Mutex::new(hybrid),
+        })
+    }
+
+    /// Execute a write operation via the writer server
+    #[pyo3(signature = (sql, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<usize> {
+        let params = extract_params(py, params)?;
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.execute(sql, params).map_err(to_py_err)
+    }
+
+    /// Execute a write operation and return the last insert rowid
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<i64> {
+        let params = extract_params(py, params)?;
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.execute_returning_rowid(sql, params).map_err(to_py_err)
+    }
+
+    /// Execute multiple SQL statements via the writer server
+    fn executescript(&self, sql: &str) -> PyResult<()> {
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.execute_batch(sql).map_err(to_py_err)
+    }
+
+    /// Query data locally (read-only) and return all rows
+    #[pyo3(signature = (sql, params=None))]
+    fn query_fetchall<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Py<PyList>> {
+        let params = extract_params(py, params)?;
+        let hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let read_conn = hybrid.read_connection();
+        let mut stmt = read_conn.query(sql, params).map_err(to_py_err)?;
+
+        let mut rows = Vec::new();
+        while stmt.step().map_err(to_py_err)? {
+            let row_values: Vec<PyObject> = (0..stmt.column_count())
+                .map(|i| value_to_py(py, stmt.column_value(i)))
+                .collect();
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
+        }
+
+        Ok(PyList::new_bound(py, &rows).unbind())
+    }
+
+    /// Query data locally and return the first row
+    #[pyo3(signature = (sql, params=None))]
+    fn query_fetchone<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Option<Py<PyTuple>>> {
+        let params = extract_params(py, params)?;
+        let hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let read_conn = hybrid.read_connection();
+        let mut stmt = read_conn.query(sql, params).map_err(to_py_err)?;
+
+        if stmt.step().map_err(to_py_err)? {
+            let row_values: Vec<PyObject> = (0..stmt.column_count())
+                .map(|i| value_to_py(py, stmt.column_value(i)))
+                .collect();
+            Ok(Some(PyTuple::new_bound(py, &row_values).unbind()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Begin a transaction (on the writer server)
+    fn begin(&self) -> PyResult<()> {
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.begin_transaction().map_err(to_py_err)
+    }
+
+    /// Commit the current transaction
+    fn commit(&self) -> PyResult<()> {
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.commit().map_err(to_py_err)
+    }
+
+    /// Rollback the current transaction
+    fn rollback(&self) -> PyResult<()> {
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.rollback().map_err(to_py_err)
+    }
+
+    /// Ping the writer server
+    fn ping(&self) -> PyResult<()> {
+        let mut hybrid = self.hybrid.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        hybrid.ping().map_err(to_py_err)
+    }
+}
+
+/// Connect to a hybrid connection (convenience function)
+#[pyfunction]
+fn hybrid_connect(database_path: &str, socket_path: &str) -> PyResult<PyHybridConnection> {
+    PyHybridConnection::new(database_path, socket_path)
+}
+
 /// Python module
 #[pymodule]
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Connection classes
     m.add_class::<PyConnection>()?;
     m.add_class::<PyCursor>()?;
     m.add_class::<PyOpenFlags>()?;
+
+    // Writer server and client classes
+    m.add_class::<PyWriterServerHandle>()?;
+    m.add_class::<PyWriterClient>()?;
+    m.add_class::<PyHybridConnection>()?;
+
+    // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(hybrid_connect, m)?)?;
+
+    // Server functions
+    m.add_function(wrap_pyfunction!(start_writer_server, m)?)?;
+    m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
+
+    // Utility functions
     m.add_function(wrap_pyfunction!(sqlite_version, m)?)?;
     m.add_function(wrap_pyfunction!(sqlite_version_number, m)?)?;
     m.add_function(wrap_pyfunction!(sqlite_threadsafe, m)?)?;
     m.add_function(wrap_pyfunction!(memory_used, m)?)?;
     m.add_function(wrap_pyfunction!(memory_highwater, m)?)?;
-    m.add("SqliteError", m.py().get_type::<SqliteError>())?;
+
+    // Exceptions
+    m.add("SqliteError", m.py().get_type_bound::<SqliteError>())?;
+
     Ok(())
 }

@@ -25,6 +25,28 @@ Example usage:
         conn.execute("CREATE TABLE IF NOT EXISTS data (value TEXT)")
         conn.execute("INSERT INTO data VALUES (?)", ["hello"])
         conn.commit()
+
+Writer Server Example:
+
+    import pasyn_sqlite_core as sqlite
+
+    # Start writer server
+    server = sqlite.start_writer_server("mydb.sqlite")
+    print(f"Server running on {server.socket_path}")
+
+    # Use hybrid connection for concurrent access
+    # - Reads happen locally (fast, in-process)
+    # - Writes go through the server (serialized)
+    conn = sqlite.hybrid_connect("mydb.sqlite", server.socket_path)
+
+    # Write via server
+    conn.execute("INSERT INTO users (name) VALUES (?)", ["Bob"])
+
+    # Read locally
+    rows = conn.query_fetchall("SELECT * FROM users")
+
+    # Stop server when done
+    server.stop()
 """
 
 from .pasyn_sqlite_core import (
@@ -33,8 +55,17 @@ from .pasyn_sqlite_core import (
     Cursor,
     OpenFlags,
     SqliteError,
-    # Functions
+    # Writer Server classes
+    WriterServerHandle,
+    WriterClient,
+    HybridConnection,
+    # Connection functions
     connect,
+    hybrid_connect,
+    # Server functions
+    start_writer_server,
+    default_socket_path,
+    # Utility functions
     sqlite_version,
     sqlite_version_number,
     sqlite_threadsafe,
@@ -43,11 +74,22 @@ from .pasyn_sqlite_core import (
 )
 
 __all__ = [
+    # Classes
     "Connection",
     "Cursor",
     "OpenFlags",
     "SqliteError",
+    # Writer Server classes
+    "WriterServerHandle",
+    "WriterClient",
+    "HybridConnection",
+    # Connection functions
     "connect",
+    "hybrid_connect",
+    # Server functions
+    "start_writer_server",
+    "default_socket_path",
+    # Utility functions
     "sqlite_version",
     "sqlite_version_number",
     "sqlite_threadsafe",

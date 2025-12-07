@@ -186,3 +186,143 @@ def memory_used() -> int:
 def memory_highwater(reset: bool = False) -> int:
     """Get memory high-water mark."""
     ...
+
+# Writer Server and Client
+
+class WriterServerHandle:
+    """Handle to a running writer server."""
+
+    @property
+    def socket_path(self) -> str:
+        """Get the socket path."""
+        ...
+
+    def shutdown(self) -> None:
+        """Signal the server to shutdown."""
+        ...
+
+    def join(self) -> None:
+        """Wait for the server to stop."""
+        ...
+
+    def stop(self) -> None:
+        """Shutdown and wait for the server to stop."""
+        ...
+
+class WriterClient:
+    """Client for sending write operations to the writer server."""
+
+    def __init__(self, socket_path: str) -> None:
+        """Connect to a writer server."""
+        ...
+
+    def execute(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a SQL statement."""
+        ...
+
+    def execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a SQL statement and return the last insert rowid."""
+        ...
+
+    def executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements (batch)."""
+        ...
+
+    def begin(self) -> None:
+        """Begin a transaction."""
+        ...
+
+    def commit(self) -> None:
+        """Commit the current transaction."""
+        ...
+
+    def rollback(self) -> None:
+        """Rollback the current transaction."""
+        ...
+
+    def ping(self) -> None:
+        """Ping the server."""
+        ...
+
+    def shutdown_server(self) -> None:
+        """Shutdown the server."""
+        ...
+
+class HybridConnection:
+    """
+    A hybrid connection that reads locally and writes via the writer server.
+
+    This is the recommended way to use the library for concurrent access:
+    - Read operations are performed directly on a local read-only connection
+    - Write operations are sent to the writer server via Unix socket
+    """
+
+    def __init__(self, database_path: str, socket_path: str) -> None:
+        """
+        Create a new hybrid connection.
+
+        Args:
+            database_path: Path to the SQLite database
+            socket_path: Path to the writer server Unix socket
+        """
+        ...
+
+    def execute(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation via the writer server."""
+        ...
+
+    def execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation and return the last insert rowid."""
+        ...
+
+    def executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements via the writer server."""
+        ...
+
+    def query_fetchall(self, sql: str, params: SqliteParams = None) -> List[SqliteRow]:
+        """Query data locally (read-only) and return all rows."""
+        ...
+
+    def query_fetchone(self, sql: str, params: SqliteParams = None) -> Optional[SqliteRow]:
+        """Query data locally and return the first row."""
+        ...
+
+    def begin(self) -> None:
+        """Begin a transaction (on the writer server)."""
+        ...
+
+    def commit(self) -> None:
+        """Commit the current transaction."""
+        ...
+
+    def rollback(self) -> None:
+        """Rollback the current transaction."""
+        ...
+
+    def ping(self) -> None:
+        """Ping the writer server."""
+        ...
+
+def start_writer_server(
+    database_path: str,
+    socket_path: Optional[str] = None
+) -> WriterServerHandle:
+    """
+    Start a writer server that handles all write operations via Unix socket.
+
+    Args:
+        database_path: Path to the SQLite database
+        socket_path: Path for the Unix socket (optional, uses default if not specified)
+
+    Returns:
+        Handle to the running server
+    """
+    ...
+
+def default_socket_path(database_path: str) -> str:
+    """Get the default socket path for a database."""
+    ...
+
+def hybrid_connect(database_path: str, socket_path: str) -> HybridConnection:
+    """Connect to a hybrid connection (convenience function)."""
+    ...

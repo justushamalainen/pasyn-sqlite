@@ -51,6 +51,11 @@ impl OpenFlags {
     pub const fn bits(self) -> i32 {
         self.0
     }
+
+    /// Create flags from a raw value
+    pub const fn from_bits(bits: i32) -> Self {
+        OpenFlags(bits)
+    }
 }
 
 impl Default for OpenFlags {
