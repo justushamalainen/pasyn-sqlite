@@ -1302,6 +1302,36 @@ impl PyPersistentNativeAsyncClient {
         })
     }
 
+    /// Execute the same SQL statement with multiple parameter sets (returns awaitable).
+    ///
+    /// This is more efficient than calling execute() multiple times because
+    /// the statement is prepared once and reused for each parameter set.
+    /// Returns a tuple of (success, total_rows_affected, last_insert_rowid, error_message).
+    fn execute_many<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params_batch: &Bound<'py, PyList>,
+    ) -> PyResult<PersistentNativeExecuteAwaitable> {
+        // Convert Python list of parameter lists to Vec<Vec<Value>>
+        let batch: Vec<Vec<RustValue>> = params_batch
+            .iter()
+            .map(|item| extract_params(py, Some(&item)))
+            .collect::<PyResult<_>>()?;
+
+        let request = Request::execute_many(sql, batch);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        Ok(PersistentNativeExecuteAwaitable {
+            connection: self.connection.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        })
+    }
+
     /// Execute multiple SQL statements (returns awaitable).
     fn executescript(&self, sql: &str) -> PersistentNativeExecuteAwaitable {
         let request = Request::execute_batch(sql);

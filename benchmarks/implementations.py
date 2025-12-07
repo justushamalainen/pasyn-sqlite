@@ -342,15 +342,12 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
         self, sql: str, parameters: Sequence[Sequence[Any]]
     ) -> None:
         assert self._write_client is not None
-        # Use executescript to run all inserts in a single transaction
-        # This is more efficient than individual execute calls
-        # The server wraps execute_many in a transaction automatically
         if not parameters:
             return
-        # Execute each set of parameters - server auto-commits each
-        # For efficiency in transactions, use run_in_transaction
-        for params in parameters:
-            await self._write_client.execute(sql, list(params))
+        # Use execute_many for efficient batched execution
+        # This sends all parameters in a single request
+        # The server wraps this in a transaction automatically for efficiency
+        await self._write_client.execute_many(sql, [list(p) for p in parameters])
 
     async def commit(self) -> None:
         assert self._write_client is not None
