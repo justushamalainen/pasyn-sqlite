@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: 'Publish to PyPI'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-python-package:
+    name: Build Python Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+
+  build-rust-wheels:
+    name: Build Rust Wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite dev (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install SQLite dev (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite3
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        working-directory: pasyn-sqlite-core
+        run: maturin build --features python --release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: pasyn-sqlite-core/target/wheels/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-python-package, build-rust-wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Python package
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rust-wheel-*
+          path: rust-wheels/
+          merge-multiple: true
+
+      - name: Move wheels to dist
+        run: mv rust-wheels/*.whl dist/ || true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
