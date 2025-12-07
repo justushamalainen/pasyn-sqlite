@@ -326,3 +326,173 @@ def default_socket_path(database_path: str) -> str:
 def hybrid_connect(database_path: str, socket_path: str) -> HybridConnection:
     """Connect to a hybrid connection (convenience function)."""
     ...
+
+# =============================================================================
+# Async Classes (true async, no thread pool)
+# =============================================================================
+
+class AsyncWriterClient:
+    """
+    True async client for sending write operations to the writer server.
+
+    Uses asyncio's native socket operations - no thread pool, pure async I/O.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        """Initialize the async client (call connect() to actually connect)."""
+        ...
+
+    async def connect(self) -> None:
+        """Connect to the writer server asynchronously."""
+        ...
+
+    def close(self) -> None:
+        """Close the connection."""
+        ...
+
+    async def write_execute(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a SQL statement asynchronously."""
+        ...
+
+    async def write_execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a SQL statement and return the last insert rowid."""
+        ...
+
+    async def write_executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements asynchronously."""
+        ...
+
+    async def write_begin(self) -> None:
+        """Begin a transaction asynchronously."""
+        ...
+
+    async def write_commit(self) -> None:
+        """Commit the current transaction asynchronously."""
+        ...
+
+    async def write_rollback(self) -> None:
+        """Rollback the current transaction asynchronously."""
+        ...
+
+    async def write_ping(self) -> None:
+        """Ping the server asynchronously."""
+        ...
+
+    async def write_shutdown_server(self) -> None:
+        """Shutdown the server asynchronously."""
+        ...
+
+
+class AsyncHybridConnection:
+    """
+    True async hybrid connection - reads locally, writes via async socket.
+
+    - Read operations are synchronous (fast, local SQLite, no I/O wait)
+    - Write operations use true async I/O (non-blocking socket, event loop driven)
+    """
+
+    def __init__(self, database_path: str, socket_path: str) -> None:
+        """Initialize the async hybrid connection (call connect() to connect)."""
+        ...
+
+    async def connect(self) -> None:
+        """Connect to the database (read) and writer server (write)."""
+        ...
+
+    def close(self) -> None:
+        """Close all connections."""
+        ...
+
+    # Async write methods
+    async def write_execute(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation via the writer server (async)."""
+        ...
+
+    async def write_execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation and return the last insert rowid (async)."""
+        ...
+
+    async def write_executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements via the writer server (async)."""
+        ...
+
+    async def write_begin(self) -> None:
+        """Begin a transaction on the writer server (async)."""
+        ...
+
+    async def write_commit(self) -> None:
+        """Commit the current transaction (async)."""
+        ...
+
+    async def write_rollback(self) -> None:
+        """Rollback the current transaction (async)."""
+        ...
+
+    async def write_ping(self) -> None:
+        """Ping the writer server (async)."""
+        ...
+
+    # Sync read methods (local, fast)
+    def query_fetchall(self, sql: str, params: SqliteParams = None) -> List[SqliteRow]:
+        """Query data locally (read-only) and return all rows."""
+        ...
+
+    def query_fetchone(self, sql: str, params: SqliteParams = None) -> Optional[SqliteRow]:
+        """Query data locally and return the first row."""
+        ...
+
+
+async def async_hybrid_connect(database_path: str, socket_path: str) -> AsyncHybridConnection:
+    """Create and connect an async hybrid connection."""
+    ...
+
+
+async def async_writer_client(socket_path: str) -> AsyncWriterClient:
+    """Create and connect an async writer client."""
+    ...
+
+
+# =============================================================================
+# Protocol Serialization (for custom async implementations)
+# =============================================================================
+
+def serialize_execute_request(sql: str, params: SqliteParams = None) -> bytes:
+    """Serialize an execute request to bytes."""
+    ...
+
+def serialize_execute_returning_rowid_request(sql: str, params: SqliteParams = None) -> bytes:
+    """Serialize an execute_returning_rowid request to bytes."""
+    ...
+
+def serialize_executescript_request(sql: str) -> bytes:
+    """Serialize an executescript request to bytes."""
+    ...
+
+def serialize_begin_request() -> bytes:
+    """Serialize a begin transaction request to bytes."""
+    ...
+
+def serialize_commit_request() -> bytes:
+    """Serialize a commit request to bytes."""
+    ...
+
+def serialize_rollback_request() -> bytes:
+    """Serialize a rollback request to bytes."""
+    ...
+
+def serialize_ping_request() -> bytes:
+    """Serialize a ping request to bytes."""
+    ...
+
+def serialize_shutdown_request() -> bytes:
+    """Serialize a shutdown request to bytes."""
+    ...
+
+def parse_response(data: bytes) -> Tuple[bool, int, int, Optional[str]]:
+    """
+    Parse response from bytes.
+
+    Returns:
+        Tuple of (success, rows_affected, last_insert_rowid, error_message)
+    """
+    ...

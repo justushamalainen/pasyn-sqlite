@@ -585,6 +585,120 @@ fn default_socket_path(database_path: &str) -> String {
     ServerConfig::default_socket_path(database_path).to_string_lossy().to_string()
 }
 
+// =============================================================================
+// Protocol serialization for async I/O
+// These functions allow Python to handle async socket I/O natively
+// =============================================================================
+
+use crate::protocol::{Request, Response, RequestType};
+
+/// Serialize an execute request to bytes
+#[pyfunction]
+#[pyo3(signature = (sql, params=None))]
+fn serialize_execute_request<'py>(
+    py: Python<'py>,
+    sql: &str,
+    params: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Py<PyBytes>> {
+    let params = extract_params(py, params)?;
+    let request = Request::execute(sql, params);
+    let data = request.serialize();
+    // Prepend length (4 bytes, little-endian)
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    Ok(PyBytes::new_bound(py, &msg).unbind())
+}
+
+/// Serialize an execute_returning_rowid request to bytes
+#[pyfunction]
+#[pyo3(signature = (sql, params=None))]
+fn serialize_execute_returning_rowid_request<'py>(
+    py: Python<'py>,
+    sql: &str,
+    params: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Py<PyBytes>> {
+    let params = extract_params(py, params)?;
+    let request = Request::execute_returning_rowid(sql, params);
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    Ok(PyBytes::new_bound(py, &msg).unbind())
+}
+
+/// Serialize an execute_batch request to bytes
+#[pyfunction]
+fn serialize_executescript_request(py: Python<'_>, sql: &str) -> Py<PyBytes> {
+    let request = Request::execute_batch(sql);
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Serialize a begin transaction request to bytes
+#[pyfunction]
+fn serialize_begin_request(py: Python<'_>) -> Py<PyBytes> {
+    let request = Request::begin_transaction();
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Serialize a commit request to bytes
+#[pyfunction]
+fn serialize_commit_request(py: Python<'_>) -> Py<PyBytes> {
+    let request = Request::commit();
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Serialize a rollback request to bytes
+#[pyfunction]
+fn serialize_rollback_request(py: Python<'_>) -> Py<PyBytes> {
+    let request = Request::rollback();
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Serialize a ping request to bytes
+#[pyfunction]
+fn serialize_ping_request(py: Python<'_>) -> Py<PyBytes> {
+    let request = Request::ping();
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Serialize a shutdown request to bytes
+#[pyfunction]
+fn serialize_shutdown_request(py: Python<'_>) -> Py<PyBytes> {
+    let request = Request::shutdown();
+    let data = request.serialize();
+    let mut msg = (data.len() as u32).to_le_bytes().to_vec();
+    msg.extend(data);
+    PyBytes::new_bound(py, &msg).unbind()
+}
+
+/// Parse response from bytes, returns (success, rows_affected, last_insert_rowid, error_message)
+#[pyfunction]
+fn parse_response(py: Python<'_>, data: &[u8]) -> PyResult<(bool, i64, i64, Option<String>)> {
+    let response = Response::deserialize(data).map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to parse response: {}", e))
+    })?;
+    Ok((
+        response.is_ok(),
+        response.rows_affected,
+        response.last_insert_rowid,
+        response.error_message,
+    ))
+}
+
 /// Client for sending write operations to the writer server
 #[pyclass(name = "WriterClient")]
 pub struct PyWriterClient {
@@ -821,6 +935,17 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Server functions
     m.add_function(wrap_pyfunction!(start_writer_server, m)?)?;
     m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
+
+    // Protocol serialization functions (for async I/O)
+    m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_execute_returning_rowid_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_executescript_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_begin_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_commit_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_rollback_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_ping_request, m)?)?;
+    m.add_function(wrap_pyfunction!(serialize_shutdown_request, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_response, m)?)?;
 
     // Utility functions
     m.add_function(wrap_pyfunction!(sqlite_version, m)?)?;
