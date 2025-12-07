@@ -12,7 +12,7 @@ use crate::error::Error as RustError;
 use crate::statement::Statement as RustStatement;
 use crate::value::Value as RustValue;
 use crate::server::{ServerConfig, ServerHandle, WriterServer};
-use crate::client::{HybridConnection as RustHybridConnection, WriterClient as RustWriterClient};
+use crate::client::{HybridConnection as RustHybridConnection, WriterClient as RustWriterClient, MultiplexedClient as RustMultiplexedClient};
 
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
@@ -1394,6 +1394,145 @@ fn persistent_native_async_client(socket_path: &str) -> PyResult<PyPersistentNat
     PyPersistentNativeAsyncClient::new(socket_path)
 }
 
+// =============================================================================
+// Multiplexed Client - thread-safe with automatic batching
+// =============================================================================
+
+/// A multiplexed client that allows concurrent request submission from multiple threads.
+///
+/// This client uses a lock-free channel for request submission and automatically
+/// batches requests for efficient I/O. Multiple threads can call execute() concurrently
+/// without blocking each other (except briefly during actual I/O).
+///
+/// Features:
+/// - Thread-safe: can be shared across Python threads
+/// - Automatic batching: requests are batched together for efficiency
+/// - Lock-free submission: requests are submitted to a channel without blocking
+/// - No background threads: I/O is handled by one of the calling threads
+#[pyclass(name = "MultiplexedClient")]
+pub struct PyMultiplexedClient {
+    client: Arc<RustMultiplexedClient>,
+}
+
+#[pymethods]
+impl PyMultiplexedClient {
+    /// Create a new multiplexed client connected to the given socket path.
+    #[new]
+    fn new(socket_path: &str) -> PyResult<Self> {
+        let client = RustMultiplexedClient::connect(socket_path).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to connect: {}", e))
+        })?;
+        Ok(PyMultiplexedClient {
+            client: Arc::new(client),
+        })
+    }
+
+    /// Execute a SQL statement. Returns the number of rows affected.
+    ///
+    /// This method is thread-safe and can be called from multiple threads concurrently.
+    /// The GIL is released during I/O operations.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(&self, py: Python<'_>, sql: String, params: Option<&Bound<'_, PyAny>>) -> PyResult<i64> {
+        let params = extract_params(py, params)?;
+        let client = self.client.clone();
+
+        // Release GIL during blocking I/O
+        py.allow_threads(move || {
+            client.execute(&sql, params).map(|rows| rows as i64).map_err(to_py_err)
+        })
+    }
+
+    /// Execute a SQL statement and return the last insert rowid.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid(&self, py: Python<'_>, sql: String, params: Option<&Bound<'_, PyAny>>) -> PyResult<i64> {
+        let params = extract_params(py, params)?;
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.execute_returning_rowid(&sql, params).map_err(to_py_err)
+        })
+    }
+
+    /// Execute the same SQL statement with multiple parameter sets.
+    ///
+    /// This is more efficient than calling execute() multiple times because
+    /// the statement is prepared once and reused for each parameter set.
+    /// Returns the total number of rows affected.
+    fn execute_many(&self, py: Python<'_>, sql: String, params_batch: &Bound<'_, PyList>) -> PyResult<i64> {
+        // Convert Python list of parameter lists to Vec<Vec<Value>>
+        let batch: Vec<Vec<RustValue>> = params_batch
+            .iter()
+            .map(|item| extract_params(py, Some(&item)))
+            .collect::<PyResult<_>>()?;
+
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.execute_many(&sql, batch).map(|rows| rows as i64).map_err(to_py_err)
+        })
+    }
+
+    /// Execute multiple SQL statements (batch/script).
+    fn executescript(&self, py: Python<'_>, sql: String) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.execute_batch(&sql).map_err(to_py_err)
+        })
+    }
+
+    /// Begin a transaction.
+    fn begin(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.begin_transaction().map_err(to_py_err)
+        })
+    }
+
+    /// Commit the current transaction.
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.commit().map_err(to_py_err)
+        })
+    }
+
+    /// Rollback the current transaction.
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.rollback().map_err(to_py_err)
+        })
+    }
+
+    /// Ping the server to check if it's alive.
+    fn ping(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.ping().map_err(to_py_err)
+        })
+    }
+
+    /// Request the server to shutdown.
+    fn shutdown_server(&self, py: Python<'_>) -> PyResult<()> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.shutdown().map_err(to_py_err)
+        })
+    }
+}
+
+/// Create a multiplexed client (convenience function).
+#[pyfunction]
+fn multiplexed_client(socket_path: &str) -> PyResult<PyMultiplexedClient> {
+    PyMultiplexedClient::new(socket_path)
+}
+
 /// Python module
 #[pymodule]
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1413,6 +1552,9 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPersistentNativeAsyncClient>()?;
     m.add_class::<PersistentNativeExecuteAwaitable>()?;
 
+    // Multiplexed client class
+    m.add_class::<PyMultiplexedClient>()?;
+
     // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(hybrid_connect, m)?)?;
@@ -1422,6 +1564,7 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
     m.add_function(wrap_pyfunction!(native_async_client, m)?)?;
     m.add_function(wrap_pyfunction!(persistent_native_async_client, m)?)?;
+    m.add_function(wrap_pyfunction!(multiplexed_client, m)?)?;
 
     // Protocol serialization functions (for async I/O)
     m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;

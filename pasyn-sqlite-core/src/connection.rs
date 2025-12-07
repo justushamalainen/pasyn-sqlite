@@ -162,6 +162,35 @@ impl Connection {
         stmt.execute(params)
     }
 
+    /// Execute the same SQL statement with multiple parameter sets
+    ///
+    /// This is more efficient than calling execute() multiple times because
+    /// the statement is prepared once and reused for each parameter set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pasyn_sqlite_core::Connection;
+    ///
+    /// let conn = Connection::open_in_memory()?;
+    /// conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")?;
+    /// conn.execute_many(
+    ///     "INSERT INTO users (name) VALUES (?1)",
+    ///     vec![vec!["Alice".into()], vec!["Bob".into()], vec!["Carol".into()]]
+    /// )?;
+    /// # Ok::<(), pasyn_sqlite_core::Error>(())
+    /// ```
+    pub fn execute_many(&self, sql: &str, params_batch: Vec<Vec<Value>>) -> Result<usize> {
+        let mut stmt = self.prepare(sql)?;
+        let mut total_changes = 0usize;
+
+        for params in params_batch {
+            total_changes += stmt.execute(params)?;
+        }
+
+        Ok(total_changes)
+    }
+
     /// Execute a SQL script (multiple statements)
     ///
     /// This is useful for running DDL scripts or multiple statements at once.
