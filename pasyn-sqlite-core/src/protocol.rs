@@ -33,6 +33,8 @@ pub enum RequestType {
     Ping = 7,
     /// Shutdown the server
     Shutdown = 8,
+    /// Execute same SQL with multiple parameter sets (executemany)
+    ExecuteMany = 9,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -48,6 +50,7 @@ impl TryFrom<u8> for RequestType {
             6 => Ok(RequestType::Rollback),
             7 => Ok(RequestType::Ping),
             8 => Ok(RequestType::Shutdown),
+            9 => Ok(RequestType::ExecuteMany),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown request type: {}", value),
@@ -89,6 +92,8 @@ pub struct Request {
     pub request_type: RequestType,
     pub sql: Option<String>,
     pub params: Vec<Value>,
+    /// Multiple parameter sets for ExecuteMany
+    pub params_batch: Vec<Vec<Value>>,
 }
 
 impl Request {
@@ -99,6 +104,7 @@ impl Request {
             request_type: RequestType::Execute,
             sql: Some(sql.into()),
             params,
+            params_batch: Vec::new(),
         }
     }
 
@@ -109,6 +115,18 @@ impl Request {
             request_type: RequestType::ExecuteReturningRowId,
             sql: Some(sql.into()),
             params,
+            params_batch: Vec::new(),
+        }
+    }
+
+    /// Create an execute_many request (same SQL, multiple parameter sets)
+    pub fn execute_many(sql: impl Into<String>, params_batch: Vec<Vec<Value>>) -> Self {
+        Request {
+            request_id: 0,
+            request_type: RequestType::ExecuteMany,
+            sql: Some(sql.into()),
+            params: Vec::new(),
+            params_batch,
         }
     }
 
@@ -119,6 +137,7 @@ impl Request {
             request_type: RequestType::ExecuteBatch,
             sql: Some(sql.into()),
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -129,6 +148,7 @@ impl Request {
             request_type: RequestType::BeginTransaction,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -139,6 +159,7 @@ impl Request {
             request_type: RequestType::Commit,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -149,6 +170,7 @@ impl Request {
             request_type: RequestType::Rollback,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -159,6 +181,7 @@ impl Request {
             request_type: RequestType::Ping,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -169,6 +192,7 @@ impl Request {
             request_type: RequestType::Shutdown,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
         }
     }
 
@@ -207,6 +231,17 @@ impl Request {
         // Serialize each param
         for param in &self.params {
             serialize_value(&mut buf, param);
+        }
+
+        // Params batch count (for ExecuteMany)
+        buf.extend_from_slice(&(self.params_batch.len() as u32).to_le_bytes());
+
+        // Serialize each params set in batch
+        for params in &self.params_batch {
+            buf.extend_from_slice(&(params.len() as u32).to_le_bytes());
+            for param in params {
+                serialize_value(&mut buf, param);
+            }
         }
 
         buf
@@ -276,11 +311,28 @@ impl Request {
             params.push(deserialize_value(reader)?);
         }
 
+        // Params batch count
+        reader.read_exact(&mut len_bytes)?;
+        let batch_count = u32::from_le_bytes(len_bytes) as usize;
+
+        // Params batch
+        let mut params_batch = Vec::with_capacity(batch_count);
+        for _ in 0..batch_count {
+            reader.read_exact(&mut len_bytes)?;
+            let set_count = u32::from_le_bytes(len_bytes) as usize;
+            let mut param_set = Vec::with_capacity(set_count);
+            for _ in 0..set_count {
+                param_set.push(deserialize_value(reader)?);
+            }
+            params_batch.push(param_set);
+        }
+
         Ok(Request {
             request_id,
             request_type,
             sql,
             params,
+            params_batch,
         })
     }
 }

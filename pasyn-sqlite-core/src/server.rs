@@ -244,6 +244,38 @@ impl WriterServer {
                     Response::error("Missing SQL statement")
                 }
             }
+            RequestType::ExecuteMany => {
+                if let Some(ref sql) = request.sql {
+                    // Wrap in transaction for efficiency (prevents auto-commit per row)
+                    if conn.is_autocommit() {
+                        // Start implicit transaction
+                        if let Err(e) = conn.execute_batch("BEGIN") {
+                            return Response::error(e.to_string());
+                        }
+                        let result = conn.execute_many(sql, request.params_batch.clone());
+                        // Commit the transaction
+                        if let Err(e) = conn.execute_batch("COMMIT") {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            return Response::error(e.to_string());
+                        }
+                        match result {
+                            Ok(rows) => Response::ok(rows as i64, conn.last_insert_rowid()),
+                            Err(e) => {
+                                let _ = conn.execute_batch("ROLLBACK");
+                                Response::error(e.to_string())
+                            }
+                        }
+                    } else {
+                        // Already in a transaction, just execute
+                        match conn.execute_many(sql, request.params_batch.clone()) {
+                            Ok(rows) => Response::ok(rows as i64, conn.last_insert_rowid()),
+                            Err(e) => Response::error(e.to_string()),
+                        }
+                    }
+                } else {
+                    Response::error("Missing SQL statement")
+                }
+            }
             RequestType::ExecuteBatch => {
                 if let Some(ref sql) = request.sql {
                     match conn.execute_batch(sql) {

@@ -1453,6 +1453,25 @@ impl PyMultiplexedClient {
         })
     }
 
+    /// Execute the same SQL statement with multiple parameter sets.
+    ///
+    /// This is more efficient than calling execute() multiple times because
+    /// the statement is prepared once and reused for each parameter set.
+    /// Returns the total number of rows affected.
+    fn execute_many(&self, py: Python<'_>, sql: String, params_batch: &Bound<'_, PyList>) -> PyResult<i64> {
+        // Convert Python list of parameter lists to Vec<Vec<Value>>
+        let batch: Vec<Vec<RustValue>> = params_batch
+            .iter()
+            .map(|item| extract_params(py, Some(&item)))
+            .collect::<PyResult<_>>()?;
+
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            client.execute_many(&sql, batch).map(|rows| rows as i64).map_err(to_py_err)
+        })
+    }
+
     /// Execute multiple SQL statements (batch/script).
     fn executescript(&self, py: Python<'_>, sql: String) -> PyResult<()> {
         let client = self.client.clone();

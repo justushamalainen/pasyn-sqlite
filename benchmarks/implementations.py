@@ -425,10 +425,9 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         self, sql: str, parameters: Sequence[Sequence[Any]]
     ) -> None:
         assert self._client is not None
-        # Execute each set of parameters as a separate write
-        # The multiplexed client will batch these efficiently
-        for params in parameters:
-            self._client.execute(sql, list(params))
+        # Use execute_many for efficient batched execution
+        # This sends all parameters in a single request
+        self._client.execute_many(sql, [list(p) for p in parameters])
 
     async def commit(self) -> None:
         assert self._client is not None

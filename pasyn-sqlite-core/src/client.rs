@@ -112,6 +112,23 @@ impl WriterClient {
         }
     }
 
+    /// Execute the same SQL with multiple parameter sets (executemany)
+    ///
+    /// Returns the total number of rows affected.
+    pub fn execute_many(&mut self, sql: &str, params_batch: Vec<Vec<Value>>) -> Result<usize> {
+        let request = Request::execute_many(sql, params_batch);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(response.rows_affected as usize)
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
     /// Begin a transaction
     pub fn begin_transaction(&mut self) -> Result<()> {
         let request = Request::begin_transaction();
@@ -395,6 +412,23 @@ impl MultiplexedClient {
 
         if response.is_ok() {
             Ok(())
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
+    /// Execute the same SQL with multiple parameter sets (executemany)
+    ///
+    /// Returns the total number of rows affected.
+    pub fn execute_many(&self, sql: &str, params_batch: Vec<Vec<Value>>) -> Result<usize> {
+        let request = Request::execute_many(sql, params_batch);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(response.rows_affected as usize)
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
