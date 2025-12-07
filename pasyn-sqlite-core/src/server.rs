@@ -205,14 +205,14 @@ impl WriterServer {
 
             // Handle shutdown request
             if request.request_type == RequestType::Shutdown {
-                let response = Response::simple_ok();
+                let response = Response::simple_ok().with_id(request.request_id);
                 write_message(&mut writer, &response.serialize())?;
                 self.shutdown();
                 break;
             }
 
-            // Process request
-            let response = self.process_request(conn, &request);
+            // Process request and echo back request_id
+            let response = self.process_request(conn, &request).with_id(request.request_id);
 
             // Send response
             write_message(&mut writer, &response.serialize())?;

@@ -10,8 +10,8 @@ use crate::value::Value;
 /// Magic bytes to identify our protocol
 const PROTOCOL_MAGIC: &[u8; 4] = b"PSQL";
 
-/// Protocol version
-const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version (2 = with request_id support)
+const PROTOCOL_VERSION: u8 = 2;
 
 /// Request types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,8 @@ impl TryFrom<u8> for ResponseStatus {
 /// A request to the writer server
 #[derive(Debug, Clone)]
 pub struct Request {
+    /// Unique request ID for multiplexing (echoed back in response)
+    pub request_id: u64,
     pub request_type: RequestType,
     pub sql: Option<String>,
     pub params: Vec<Value>,
@@ -93,6 +95,7 @@ impl Request {
     /// Create a new execute request
     pub fn execute(sql: impl Into<String>, params: Vec<Value>) -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::Execute,
             sql: Some(sql.into()),
             params,
@@ -102,6 +105,7 @@ impl Request {
     /// Create an execute request that returns the last insert rowid
     pub fn execute_returning_rowid(sql: impl Into<String>, params: Vec<Value>) -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::ExecuteReturningRowId,
             sql: Some(sql.into()),
             params,
@@ -111,6 +115,7 @@ impl Request {
     /// Create a batch execute request
     pub fn execute_batch(sql: impl Into<String>) -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::ExecuteBatch,
             sql: Some(sql.into()),
             params: Vec::new(),
@@ -120,6 +125,7 @@ impl Request {
     /// Create a begin transaction request
     pub fn begin_transaction() -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::BeginTransaction,
             sql: None,
             params: Vec::new(),
@@ -129,6 +135,7 @@ impl Request {
     /// Create a commit request
     pub fn commit() -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::Commit,
             sql: None,
             params: Vec::new(),
@@ -138,6 +145,7 @@ impl Request {
     /// Create a rollback request
     pub fn rollback() -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::Rollback,
             sql: None,
             params: Vec::new(),
@@ -147,6 +155,7 @@ impl Request {
     /// Create a ping request
     pub fn ping() -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::Ping,
             sql: None,
             params: Vec::new(),
@@ -156,10 +165,17 @@ impl Request {
     /// Create a shutdown request
     pub fn shutdown() -> Self {
         Request {
+            request_id: 0,
             request_type: RequestType::Shutdown,
             sql: None,
             params: Vec::new(),
         }
+    }
+
+    /// Set the request ID
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.request_id = id;
+        self
     }
 
     /// Serialize the request to bytes
@@ -169,6 +185,9 @@ impl Request {
         // Magic + version
         buf.extend_from_slice(PROTOCOL_MAGIC);
         buf.push(PROTOCOL_VERSION);
+
+        // Request ID (8 bytes, little endian)
+        buf.extend_from_slice(&self.request_id.to_le_bytes());
 
         // Request type
         buf.push(self.request_type as u8);
@@ -221,6 +240,11 @@ impl Request {
             ));
         }
 
+        // Request ID
+        let mut id_bytes = [0u8; 8];
+        reader.read_exact(&mut id_bytes)?;
+        let request_id = u64::from_le_bytes(id_bytes);
+
         // Request type
         let mut req_type = [0u8; 1];
         reader.read_exact(&mut req_type)?;
@@ -253,6 +277,7 @@ impl Request {
         }
 
         Ok(Request {
+            request_id,
             request_type,
             sql,
             params,
@@ -263,6 +288,8 @@ impl Request {
 /// A response from the writer server
 #[derive(Debug, Clone)]
 pub struct Response {
+    /// Request ID (echoed back from request for multiplexing)
+    pub request_id: u64,
     pub status: ResponseStatus,
     pub rows_affected: i64,
     pub last_insert_rowid: i64,
@@ -273,6 +300,7 @@ impl Response {
     /// Create a success response
     pub fn ok(rows_affected: i64, last_insert_rowid: i64) -> Self {
         Response {
+            request_id: 0,
             status: ResponseStatus::Ok,
             rows_affected,
             last_insert_rowid,
@@ -283,6 +311,7 @@ impl Response {
     /// Create an error response
     pub fn error(message: impl Into<String>) -> Self {
         Response {
+            request_id: 0,
             status: ResponseStatus::Error,
             rows_affected: 0,
             last_insert_rowid: 0,
@@ -295,6 +324,12 @@ impl Response {
         Self::ok(0, 0)
     }
 
+    /// Set the request ID (echoed from request)
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.request_id = id;
+        self
+    }
+
     /// Serialize the response to bytes
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -302,6 +337,9 @@ impl Response {
         // Magic + version
         buf.extend_from_slice(PROTOCOL_MAGIC);
         buf.push(PROTOCOL_VERSION);
+
+        // Request ID (8 bytes, little endian)
+        buf.extend_from_slice(&self.request_id.to_le_bytes());
 
         // Status
         buf.push(self.status as u8);
@@ -352,6 +390,11 @@ impl Response {
             ));
         }
 
+        // Request ID
+        let mut id_bytes = [0u8; 8];
+        reader.read_exact(&mut id_bytes)?;
+        let request_id = u64::from_le_bytes(id_bytes);
+
         // Status
         let mut status_byte = [0u8; 1];
         reader.read_exact(&mut status_byte)?;
@@ -383,6 +426,7 @@ impl Response {
         };
 
         Ok(Response {
+            request_id,
             status,
             rows_affected,
             last_insert_rowid,

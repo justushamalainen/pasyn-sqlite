@@ -97,6 +97,9 @@ from .pasyn_sqlite_core import (
     PersistentNativeAsyncClient,
     PersistentNativeExecuteAwaitable,
     persistent_native_async_client,
+    # Multiplexed client (thread-safe with automatic batching)
+    MultiplexedClient,
+    multiplexed_client,
     # Connection functions
     connect,
     hybrid_connect,
@@ -526,6 +529,9 @@ __all__ = [
     "PersistentNativeAsyncClient",
     "PersistentNativeExecuteAwaitable",
     "persistent_native_async_client",
+    # Multiplexed client (thread-safe with automatic batching)
+    "MultiplexedClient",
+    "multiplexed_client",
     # Async classes (asyncio socket I/O)
     "AsyncHybridConnection",
     "AsyncWriterClient",

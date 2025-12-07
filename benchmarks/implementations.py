@@ -378,6 +378,97 @@ class NativeAwaitableSQLite(BaseSQLiteImplementation):
             self._server = None
 
 
+class MultiplexedSQLite(BaseSQLiteImplementation):
+    """
+    Multiplexed client implementation using Rust thread-safe client.
+
+    This implementation:
+    - Uses a single shared connection for all operations
+    - Automatically batches concurrent requests
+    - Lock-free request submission (minimal contention)
+    - Releases GIL during I/O operations
+    - Uses local SQLite connection for reads (sync, fast)
+    """
+
+    def __init__(self) -> None:
+        self._server: pasyn_sqlite_core.WriterServerHandle | None = None
+        self._client: pasyn_sqlite_core.MultiplexedClient | None = None
+        self._read_conn: pasyn_sqlite_core.Connection | None = None
+        self._db_path: str | None = None
+        self._in_transaction: bool = False
+
+    async def setup(self, db_path: str) -> None:
+        self._db_path = db_path
+        # Start writer server
+        self._server = pasyn_sqlite_core.start_writer_server(db_path)
+        # Create multiplexed client for writes
+        self._client = pasyn_sqlite_core.MultiplexedClient(self._server.socket_path)
+        # Create local read-only connection for reads
+        self._read_conn = pasyn_sqlite_core.connect(
+            db_path, pasyn_sqlite_core.OpenFlags.readonly()
+        )
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._client is not None
+        assert self._read_conn is not None
+        sql_lower = sql.strip().upper()
+        if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
+            # Read operation - use local connection (sync)
+            return self._read_conn.execute_fetchall(sql, list(parameters))
+        else:
+            # Write operation - use multiplexed client
+            # Note: this is synchronous but releases GIL during I/O
+            self._client.execute(sql, list(parameters))
+            return []
+
+    async def executemany(
+        self, sql: str, parameters: Sequence[Sequence[Any]]
+    ) -> None:
+        assert self._client is not None
+        # Execute each set of parameters as a separate write
+        # The multiplexed client will batch these efficiently
+        for params in parameters:
+            self._client.execute(sql, list(params))
+
+    async def commit(self) -> None:
+        assert self._client is not None
+        if self._in_transaction:
+            self._client.commit()
+            self._in_transaction = False
+
+    async def begin_transaction(self) -> None:
+        assert self._client is not None
+        self._client.begin()
+        self._in_transaction = True
+
+    async def rollback(self) -> None:
+        assert self._client is not None
+        if self._in_transaction:
+            self._client.rollback()
+            self._in_transaction = False
+
+    async def run_in_transaction(
+        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+    ) -> None:
+        """Run operations within a transaction."""
+        await self.begin_transaction()
+        try:
+            await operations(self)
+            await self.commit()
+        except Exception:
+            await self.rollback()
+            raise
+
+    async def close(self) -> None:
+        if self._read_conn:
+            self._read_conn.close()
+            self._read_conn = None
+        self._client = None  # No explicit close needed
+        if self._server:
+            self._server.stop()
+            self._server = None
+
+
 # Factory function
 def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
@@ -386,6 +477,7 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
         "single_thread": SingleThreadSQLite,
         "pasyn_pool": PasynPoolSQLite,
         "native_awaitable": NativeAwaitableSQLite,
+        "multiplexed": MultiplexedSQLite,
     }
     if name not in implementations:
         raise ValueError(f"Unknown implementation: {name}")
