@@ -19,6 +19,7 @@ Benchmark categories:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import statistics
@@ -146,6 +147,17 @@ class Benchmark:
             )
         """)
 
+        # Huge data table (for ~2MB read benchmark)
+        await impl.execute("""
+            CREATE TABLE IF NOT EXISTS huge_data (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                extra_field1 TEXT,
+                extra_field2 TEXT
+            )
+        """)
+
         await impl.commit()
 
     async def populate_test_data(self, impl: BaseSQLiteImplementation) -> None:
@@ -186,6 +198,25 @@ class Benchmark:
             documents,
         )
 
+        await impl.commit()
+
+    async def populate_huge_data(self, impl: BaseSQLiteImplementation) -> None:
+        """Populate huge_data table with ~2MB of data (1000 rows × ~2KB each)."""
+        # Each row: ~20 bytes title + ~2000 bytes content + ~24 bytes extra1 + ~24 bytes extra2 ≈ 2KB
+        # 1000 rows × 2KB = ~2MB
+        huge_rows = [
+            (
+                f"HugeDocument {i}",
+                "X" * 2000,  # 2KB content
+                f"extra_data_field_1_{i:04d}",
+                f"extra_data_field_2_{i:04d}",
+            )
+            for i in range(1000)
+        ]
+        await impl.executemany(
+            "INSERT INTO huge_data (title, content, extra_field1, extra_field2) VALUES (?, ?, ?, ?)",
+            huge_rows,
+        )
         await impl.commit()
 
     async def run_timed(
@@ -238,6 +269,18 @@ class Benchmark:
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("large_read_ordered", impl_name, times)
+
+    async def bench_huge_read(
+        self, impl: BaseSQLiteImplementation, impl_name: str
+    ) -> BenchmarkResult:
+        """Benchmark: Read entire huge_data table (~2MB)."""
+
+        async def task() -> None:
+            await impl.execute("SELECT * FROM huge_data")
+
+        # Fewer iterations since each read is ~2MB
+        times = await self.run_timed(task, iterations=50)
+        return BenchmarkResult.from_times("huge_read", impl_name, times)
 
     async def bench_join_small(
         self, impl: BaseSQLiteImplementation, impl_name: str
@@ -836,8 +879,12 @@ def print_summary(all_results: dict[str, list[BenchmarkResult | WorkloadResult]]
                         )
 
 
-async def run_all_benchmarks() -> None:
-    """Run all benchmarks for all implementations."""
+async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
+    """Run all benchmarks for all implementations.
+
+    Args:
+        enable_huge_read: If True, also run the huge_read benchmark (~2MB data).
+    """
     implementations = [
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
@@ -865,10 +912,13 @@ async def run_all_benchmarks() -> None:
             print("Setting up schema and test data...")
             await bench.setup_schema(impl)
             await bench.populate_test_data(impl)
+            if enable_huge_read:
+                print("Populating huge_data table (~2MB)...")
+                await bench.populate_huge_data(impl)
             print("Done.")
 
             # Run statement benchmarks
-            statement_benchmarks = [
+            statement_benchmarks: list[tuple[str, Callable[..., Coroutine[Any, Any, BenchmarkResult]]]] = [
                 ("small_read", bench.bench_small_read),
                 ("large_read", bench.bench_large_read),
                 ("large_read_ordered", bench.bench_large_read_ordered),
@@ -881,6 +931,10 @@ async def run_all_benchmarks() -> None:
                 ("update", bench.bench_update),
                 ("delete_reinsert", bench.bench_delete),
             ]
+
+            # Add huge_read benchmark if enabled
+            if enable_huge_read:
+                statement_benchmarks.insert(3, ("huge_read", bench.bench_huge_read))
 
             for name, benchmark_func in statement_benchmarks:
                 print(f"  Running {name}...", end=" ", flush=True)
@@ -954,7 +1008,7 @@ async def run_all_benchmarks() -> None:
 
     # Statement benchmarks
     statement_names = [
-        "small_read", "large_read", "large_read_ordered",
+        "small_read", "large_read", "large_read_ordered", "huge_read",
         "join_small", "join_large", "aggregate",
         "small_write", "large_write", "batch_write",
         "update", "delete_reinsert",
@@ -986,4 +1040,11 @@ async def run_all_benchmarks() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_all_benchmarks())
+    parser = argparse.ArgumentParser(description="Run SQLite implementation benchmarks")
+    parser.add_argument(
+        "--huge-read",
+        action="store_true",
+        help="Enable the huge_read benchmark (~2MB data read)",
+    )
+    args = parser.parse_args()
+    asyncio.run(run_all_benchmarks(enable_huge_read=args.huge_read))
