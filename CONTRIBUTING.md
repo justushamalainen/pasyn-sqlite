@@ -41,7 +41,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 2. **Install all dependencies (recommended):**
    ```bash
-   make install-all
+   python tools/install.py --all
    ```
 
    Or manually:
@@ -57,42 +57,62 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    cd ..
    ```
 
+### Development Commands
+
+All development commands are Python scripts in the `tools/` directory:
+
+| Command | Description |
+|---------|-------------|
+| `python tools/install.py --all` | Install everything (Python + Rust) |
+| `python tools/install.py --dev` | Install Python package with dev dependencies |
+| `python tools/build.py` | Build all packages |
+| `python tools/test.py` | Run all tests |
+| `python tools/test.py --python` | Run Python tests only |
+| `python tools/test.py --rust` | Run Rust tests only |
+| `python tools/lint.py` | Run all linters |
+| `python tools/format.py` | Format all code |
+| `python tools/bench.py` | Run benchmarks |
+| `python tools/clean.py` | Clean build artifacts |
+
 ### Running Tests
 
 ```bash
 # Run all tests
-make test
+python tools/test.py
 
 # Run only Python tests
-make test-python
+python tools/test.py --python
 
 # Run only Rust tests
-make test-rust
+python tools/test.py --rust
+
+# Verbose output
+python tools/test.py -v
 ```
 
 ### Running Linters
 
 ```bash
 # Run all linters
-make lint
+python tools/lint.py
 
 # Run only Python linters
-make lint-python
+python tools/lint.py --python
 
 # Run only Rust linters
-make lint-rust
+python tools/lint.py --rust
 ```
 
 ### Formatting Code
 
 ```bash
-make format
+python tools/format.py
 ```
 
 ### Running Benchmarks
 
 ```bash
-make bench
+python tools/bench.py
 ```
 
 ## Project Structure
@@ -112,7 +132,7 @@ pasyn-sqlite/
 ├── pasyn-await-poc/        # Proof of concept for native awaitables
 ├── benchmarks/             # Performance benchmarks
 ├── tests/                  # Python tests
-├── Makefile                # Build and development commands
+├── tools/                  # Development scripts
 └── pyproject.toml          # Python project config
 ```
 
@@ -120,7 +140,7 @@ pasyn-sqlite/
 
 1. Create a new branch for your changes
 2. Make your changes
-3. Run tests and linters: `make test && make lint`
+3. Run tests and linters: `python tools/test.py && python tools/lint.py`
 4. Commit your changes with clear commit messages
 5. Open a pull request
 
