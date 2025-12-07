@@ -62,3 +62,26 @@ venv.bak/
 *.db
 *.sqlite
 *.sqlite3
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Maturin
+*.so
+*.dylib
+*.dll
+*.pyd
+
+# Ruff
+.ruff_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# OS
+.DS_Store
+Thumbs.db

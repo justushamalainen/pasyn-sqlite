@@ -9,6 +9,10 @@ description = "Async SQLite with thread pool - single writer, multiple readers w
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
+authors = [
+    {name = "pasyn-sqlite contributors"}
+]
+keywords = ["sqlite", "async", "asyncio", "database", "thread-pool"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -20,14 +24,53 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Framework :: AsyncIO",
     "Topic :: Database",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/pasyn/pasyn-sqlite"
+Repository = "https://github.com/pasyn/pasyn-sqlite"
+Issues = "https://github.com/pasyn/pasyn-sqlite/issues"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+bench = [
+    "pasyn-sqlite-core>=0.1.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pasyn_sqlite"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-python:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  test-rust:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            pasyn-sqlite-core/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install SQLite dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Run Rust tests
+        working-directory: pasyn-sqlite-core
+        run: cargo test --all-features
+
+  build-rust-core:
+    name: Build Rust Core (Python bindings)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install SQLite dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        working-directory: pasyn-sqlite-core
+        run: maturin build --features python --release
+
+      - name: Install wheel
+        run: pip install pasyn-sqlite-core/target/wheels/*.whl
+
+      - name: Test import
+        run: python -c "import pasyn_sqlite_core; print('pasyn_sqlite_core imported successfully')"
+
+  lint-python:
+    name: Python Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install linters
+        run: pip install ruff mypy
+
+      - name: Run ruff
+        run: ruff check .
+
+      - name: Run ruff format check
+        run: ruff format --check .
+
+  lint-rust:
+    name: Rust Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install SQLite dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Check format
+        working-directory: pasyn-sqlite-core
+        run: cargo fmt --check
+
+      - name: Run clippy
+        working-directory: pasyn-sqlite-core
+        run: cargo clippy --all-features -- -D warnings
