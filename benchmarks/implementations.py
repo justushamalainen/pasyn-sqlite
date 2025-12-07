@@ -12,6 +12,7 @@ from queue import Queue
 from typing import Any, Callable, Coroutine, Sequence
 
 import pasyn_sqlite
+import pasyn_sqlite_core
 
 
 class BaseSQLiteImplementation(ABC):
@@ -295,6 +296,88 @@ class BoundConnectionWrapper(BaseSQLiteImplementation):
         pass  # Managed by context manager
 
 
+class NativeAwaitableSQLite(BaseSQLiteImplementation):
+    """
+    Native awaitable implementation using Rust GIL-releasing awaitables.
+
+    This implementation:
+    - Uses native Rust awaitables for writes (releases GIL during socket I/O)
+    - Uses local SQLite connection for reads (sync, fast)
+    - Writes go through a writer server via Unix socket
+    """
+
+    def __init__(self) -> None:
+        self._server: pasyn_sqlite_core.WriterServerHandle | None = None
+        self._conn: pasyn_sqlite_core.NativeHybridConnection | None = None
+        self._db_path: str | None = None
+        self._in_transaction: bool = False
+
+    async def setup(self, db_path: str) -> None:
+        self._db_path = db_path
+        # Start writer server
+        self._server = pasyn_sqlite_core.start_writer_server(db_path)
+        # Create native hybrid connection
+        self._conn = pasyn_sqlite_core.native_hybrid_connect(
+            db_path, self._server.socket_path
+        )
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._conn is not None
+        sql_lower = sql.strip().upper()
+        if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
+            # Read operation - use local connection (sync)
+            return self._conn.query_fetchall(sql, list(parameters))
+        else:
+            # Write operation - use native awaitable
+            await self._conn.write_execute(sql, list(parameters))
+            return []
+
+    async def executemany(
+        self, sql: str, parameters: Sequence[Sequence[Any]]
+    ) -> None:
+        assert self._conn is not None
+        # Execute each set of parameters as a separate write
+        for params in parameters:
+            await self._conn.write_execute(sql, list(params))
+
+    async def commit(self) -> None:
+        assert self._conn is not None
+        if self._in_transaction:
+            await self._conn.write_commit()
+            self._in_transaction = False
+
+    async def begin_transaction(self) -> None:
+        assert self._conn is not None
+        await self._conn.write_begin()
+        self._in_transaction = True
+
+    async def rollback(self) -> None:
+        assert self._conn is not None
+        if self._in_transaction:
+            await self._conn.write_rollback()
+            self._in_transaction = False
+
+    async def run_in_transaction(
+        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+    ) -> None:
+        """Run operations within a transaction."""
+        await self.begin_transaction()
+        try:
+            await operations(self)
+            await self.commit()
+        except Exception:
+            await self.rollback()
+            raise
+
+    async def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+        if self._server:
+            self._server.stop()
+            self._server = None
+
+
 # Factory function
 def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
@@ -302,6 +385,7 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
         "main_thread": MainThreadSQLite,
         "single_thread": SingleThreadSQLite,
         "pasyn_pool": PasynPoolSQLite,
+        "native_awaitable": NativeAwaitableSQLite,
     }
     if name not in implementations:
         raise ValueError(f"Unknown implementation: {name}")

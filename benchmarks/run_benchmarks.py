@@ -33,6 +33,7 @@ from implementations import (
     MainThreadSQLite,
     SingleThreadSQLite,
     PasynPoolSQLite,
+    NativeAwaitableSQLite,
 )
 
 
@@ -840,8 +841,7 @@ async def run_all_benchmarks() -> None:
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
         ("pasyn_pool_1r", PasynPoolSQLite(num_readers=1)),
-        ("pasyn_pool_2r", PasynPoolSQLite(num_readers=2)),
-        ("pasyn_pool_4r", PasynPoolSQLite(num_readers=4)),
+        ("native_awaitable", NativeAwaitableSQLite()),
     ]
 
     all_results: dict[str, list[BenchmarkResult | WorkloadResult]] = {}
