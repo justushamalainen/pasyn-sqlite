@@ -2,7 +2,7 @@
 //!
 //! This module provides Python bindings to the SQLite functionality.
 
-use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
@@ -915,6 +915,242 @@ fn hybrid_connect(database_path: &str, socket_path: &str) -> PyResult<PyHybridCo
     PyHybridConnection::new(database_path, socket_path)
 }
 
+// =============================================================================
+// Native Awaitable Client - GIL-releasing async I/O
+// =============================================================================
+
+use std::os::unix::net::UnixStream;
+use std::io::{BufReader, BufWriter};
+use crate::protocol::{read_message, write_message};
+
+/// Create a StopIteration exception with the given value.
+/// This properly sets the `value` attribute, which is what Python's await extracts.
+fn make_stop_iteration(py: Python<'_>, value: PyObject) -> PyErr {
+    // Create StopIteration exception with the value as a single argument
+    // This ensures StopIteration.value is set correctly
+    let stop_iter = py.get_type_bound::<PyStopIteration>();
+    let exc = stop_iter.call1((value,)).expect("Failed to create StopIteration");
+    PyErr::from_value_bound(exc.into_any())
+}
+
+/// Native awaitable for execute operations.
+///
+/// This implements the Python awaitable protocol (__await__, __iter__, __next__)
+/// and releases the GIL during blocking socket I/O.
+#[pyclass]
+pub struct NativeExecuteAwaitable {
+    socket_path: String,
+    request_bytes: Vec<u8>,
+    completed: bool,
+    result: Option<(bool, i64, i64, Option<String>)>,
+}
+
+#[pymethods]
+impl NativeExecuteAwaitable {
+    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if slf.completed {
+            // Already completed - return cached result
+            if let Some(result) = slf.result.take() {
+                let result_obj = result.to_object(py);
+                return Err(make_stop_iteration(py, result_obj));
+            }
+            return Err(PyStopIteration::new_err(py.None()));
+        }
+
+        // Release GIL and perform blocking socket I/O
+        let socket_path = slf.socket_path.clone();
+        let request_bytes = slf.request_bytes.clone();
+
+        let result = py.allow_threads(move || {
+            // Connect to socket
+            let stream = UnixStream::connect(&socket_path)?;
+            let mut reader = BufReader::new(stream.try_clone()?);
+            let mut writer = BufWriter::new(stream);
+
+            // Send request (request_bytes already includes length prefix)
+            use std::io::Write;
+            writer.write_all(&request_bytes)?;
+            writer.flush()?;
+
+            // Read response
+            let response_data = read_message(&mut reader)?;
+            let response = Response::deserialize(&response_data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+
+            Ok::<_, std::io::Error>((
+                response.is_ok(),
+                response.rows_affected,
+                response.last_insert_rowid,
+                response.error_message,
+            ))
+        });
+
+        slf.completed = true;
+
+        match result {
+            Ok(result) => {
+                slf.result = Some(result.clone());
+                let result_obj = result.to_object(py);
+                Err(make_stop_iteration(py, result_obj))
+            }
+            Err(e) => Err(PyRuntimeError::new_err(format!("Socket error: {}", e))),
+        }
+    }
+}
+
+/// Native awaitable client that releases GIL during I/O.
+///
+/// Each method returns a native awaitable that performs the socket I/O
+/// with the GIL released, allowing other Python threads to run.
+#[pyclass(name = "NativeAsyncClient")]
+pub struct PyNativeAsyncClient {
+    socket_path: String,
+}
+
+#[pymethods]
+impl PyNativeAsyncClient {
+    #[new]
+    fn new(socket_path: &str) -> Self {
+        PyNativeAsyncClient {
+            socket_path: socket_path.to_string(),
+        }
+    }
+
+    /// Execute a SQL statement asynchronously (returns awaitable).
+    #[pyo3(signature = (sql, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<NativeExecuteAwaitable> {
+        let params = extract_params(py, params)?;
+        let request = Request::execute(sql, params);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        Ok(NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        })
+    }
+
+    /// Execute a SQL statement and return the last insert rowid (returns awaitable).
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<NativeExecuteAwaitable> {
+        let params = extract_params(py, params)?;
+        let request = Request::execute_returning_rowid(sql, params);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        Ok(NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        })
+    }
+
+    /// Execute multiple SQL statements (returns awaitable).
+    fn executescript(&self, sql: &str) -> NativeExecuteAwaitable {
+        let request = Request::execute_batch(sql);
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Begin a transaction (returns awaitable).
+    fn begin(&self) -> NativeExecuteAwaitable {
+        let request = Request::begin_transaction();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Commit the current transaction (returns awaitable).
+    fn commit(&self) -> NativeExecuteAwaitable {
+        let request = Request::commit();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Rollback the current transaction (returns awaitable).
+    fn rollback(&self) -> NativeExecuteAwaitable {
+        let request = Request::rollback();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+
+    /// Ping the server (returns awaitable).
+    fn ping(&self) -> NativeExecuteAwaitable {
+        let request = Request::ping();
+        let data = request.serialize();
+        let mut request_bytes = (data.len() as u32).to_le_bytes().to_vec();
+        request_bytes.extend(data);
+
+        NativeExecuteAwaitable {
+            socket_path: self.socket_path.clone(),
+            request_bytes,
+            completed: false,
+            result: None,
+        }
+    }
+}
+
+/// Create a native async client (convenience function).
+#[pyfunction]
+fn native_async_client(socket_path: &str) -> PyNativeAsyncClient {
+    PyNativeAsyncClient::new(socket_path)
+}
+
 /// Python module
 #[pymodule]
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -928,6 +1164,10 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWriterClient>()?;
     m.add_class::<PyHybridConnection>()?;
 
+    // Native async client classes
+    m.add_class::<PyNativeAsyncClient>()?;
+    m.add_class::<NativeExecuteAwaitable>()?;
+
     // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(hybrid_connect, m)?)?;
@@ -935,6 +1175,7 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Server functions
     m.add_function(wrap_pyfunction!(start_writer_server, m)?)?;
     m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
+    m.add_function(wrap_pyfunction!(native_async_client, m)?)?;
 
     // Protocol serialization functions (for async I/O)
     m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;

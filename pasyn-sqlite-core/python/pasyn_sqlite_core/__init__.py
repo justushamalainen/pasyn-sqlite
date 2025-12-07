@@ -89,6 +89,10 @@ from .pasyn_sqlite_core import (
     WriterServerHandle,
     WriterClient,
     HybridConnection,
+    # Native async client (GIL-releasing awaitables)
+    NativeAsyncClient,
+    NativeExecuteAwaitable,
+    native_async_client,
     # Connection functions
     connect,
     hybrid_connect,
@@ -117,6 +121,119 @@ from .pasyn_sqlite_core import (
 SqliteValue = Union[None, int, float, str, bytes]
 SqliteRow = Tuple[SqliteValue, ...]
 SqliteParams = Optional[Union[Sequence[SqliteValue], dict]]
+
+
+class NativeHybridConnection:
+    """
+    Hybrid connection with native awaitable writes (GIL-releasing).
+
+    - Read operations are synchronous (fast, local SQLite)
+    - Write operations use native Rust awaitables that release the GIL
+
+    This is similar to AsyncHybridConnection but uses native Rust awaitables
+    instead of Python's asyncio socket operations.
+    """
+
+    def __init__(self, database_path: str, socket_path: str):
+        """
+        Initialize the native hybrid connection.
+
+        Args:
+            database_path: Path to the SQLite database
+            socket_path: Path to the writer server Unix socket
+        """
+        # Open read-only connection for local reads
+        self._read_conn = Connection(database_path, OpenFlags.readonly())
+        # Create native async client for writes
+        self._write_client = NativeAsyncClient(socket_path)
+        self._socket_path = socket_path
+
+    def close(self) -> None:
+        """Close the read connection."""
+        if self._read_conn:
+            self._read_conn.close()
+            self._read_conn = None
+
+    # =========================================================================
+    # Async write methods (native awaitables with GIL release)
+    # =========================================================================
+
+    async def write_execute(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation (async, GIL-releasing)."""
+        result = await self._write_client.execute(sql, params)
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+        return rows_affected
+
+    async def write_execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
+        """Execute a write operation and return the last insert rowid (async)."""
+        result = await self._write_client.execute_returning_rowid(sql, params)
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+        return last_rowid
+
+    async def write_executescript(self, sql: str) -> None:
+        """Execute multiple SQL statements (async)."""
+        result = await self._write_client.executescript(sql)
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+
+    async def write_begin(self) -> None:
+        """Begin a transaction (async)."""
+        result = await self._write_client.begin()
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+
+    async def write_commit(self) -> None:
+        """Commit the current transaction (async)."""
+        result = await self._write_client.commit()
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+
+    async def write_rollback(self) -> None:
+        """Rollback the current transaction (async)."""
+        result = await self._write_client.rollback()
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+
+    async def write_ping(self) -> None:
+        """Ping the writer server (async)."""
+        result = await self._write_client.ping()
+        success, rows_affected, last_rowid, error_msg = result
+        if not success:
+            raise SqliteError(error_msg or "Unknown error")
+
+    # =========================================================================
+    # Sync read methods (local SQLite, fast)
+    # =========================================================================
+
+    def query_fetchall(self, sql: str, params: SqliteParams = None) -> List[SqliteRow]:
+        """Query data locally (read-only) and return all rows."""
+        return self._read_conn.execute_fetchall(sql, params)
+
+    def query_fetchone(self, sql: str, params: SqliteParams = None) -> Optional[SqliteRow]:
+        """Query data locally and return the first row."""
+        return self._read_conn.execute_fetchone(sql, params)
+
+
+def native_hybrid_connect(database_path: str, socket_path: str) -> NativeHybridConnection:
+    """
+    Create a native hybrid connection.
+
+    Args:
+        database_path: Path to the SQLite database
+        socket_path: Path to the writer server Unix socket
+
+    Returns:
+        NativeHybridConnection instance
+    """
+    return NativeHybridConnection(database_path, socket_path)
 
 
 class AsyncWriterClient:
@@ -392,12 +509,18 @@ __all__ = [
     "WriterServerHandle",
     "WriterClient",
     "HybridConnection",
-    # Async classes (true async, no thread pool)
+    # Native async classes (GIL-releasing awaitables)
+    "NativeAsyncClient",
+    "NativeExecuteAwaitable",
+    "NativeHybridConnection",
+    # Async classes (asyncio socket I/O)
     "AsyncHybridConnection",
     "AsyncWriterClient",
     # Connection functions
     "connect",
     "hybrid_connect",
+    "native_hybrid_connect",
+    "native_async_client",
     "async_hybrid_connect",
     "async_writer_client",
     # Server functions
