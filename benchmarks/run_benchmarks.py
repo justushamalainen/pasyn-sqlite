@@ -5,7 +5,7 @@ Performance benchmarks comparing SQLite implementations.
 Compares:
 1. Main thread (synchronous) - baseline
 2. Single DB thread - all operations in one background thread
-3. Pasyn-sqlite - single writer + multiple readers with work stealing
+3. Multiplexed - Rust multiplexed client with automatic batching
 
 Benchmark categories:
 - Small reads (single row)
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import statistics
 import tempfile
 import time
@@ -33,8 +32,6 @@ from implementations import (
     BaseSQLiteImplementation,
     MainThreadSQLite,
     SingleThreadSQLite,
-    PasynPoolSQLite,
-    NativeAwaitableSQLite,
     MultiplexedSQLite,
 )
 
@@ -888,8 +885,6 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
     implementations = [
         ("main_thread", MainThreadSQLite()),
         ("single_thread", SingleThreadSQLite()),
-        ("pasyn_pool_1r", PasynPoolSQLite(num_readers=1)),
-        ("native_awaitable", NativeAwaitableSQLite()),
         ("multiplexed", MultiplexedSQLite()),
     ]
 

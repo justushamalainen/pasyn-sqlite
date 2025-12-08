@@ -26,7 +26,7 @@ Example usage:
         conn.execute("INSERT INTO data VALUES (?)", ["hello"])
         conn.commit()
 
-Writer Server Example (sync):
+Multiplexed Client Example (thread-safe, automatic batching):
 
     import pasyn_sqlite_core as sqlite
 
@@ -34,44 +34,19 @@ Writer Server Example (sync):
     server = sqlite.start_writer_server("mydb.sqlite")
     print(f"Server running on {server.socket_path}")
 
-    # Use hybrid connection for concurrent access
-    conn = sqlite.hybrid_connect("mydb.sqlite", server.socket_path)
+    # Use multiplexed client for thread-safe writes
+    client = sqlite.MultiplexedClient(server.socket_path)
 
-    # Write via server (sync)
-    conn.execute("INSERT INTO users (name) VALUES (?)", ["Bob"])
+    # Execute write operations (thread-safe, releases GIL)
+    client.execute("INSERT INTO users (name) VALUES (?)", ["Bob"])
+    client.commit()
 
-    # Read locally (sync)
-    rows = conn.query_fetchall("SELECT * FROM users")
+    # Use local read-only connection for reads
+    read_conn = sqlite.connect("mydb.sqlite", sqlite.OpenFlags.readonly())
+    rows = read_conn.execute_fetchall("SELECT * FROM users")
 
     # Stop server when done
     server.stop()
-
-Async Writer Example (true async, no thread pool):
-
-    import asyncio
-    import pasyn_sqlite_core as sqlite
-
-    async def main():
-        # Start writer server
-        server = sqlite.start_writer_server("mydb.sqlite")
-
-        # Use async hybrid connection (true async I/O)
-        conn = await sqlite.async_hybrid_connect("mydb.sqlite", server.socket_path)
-
-        # Async writes via server (non-blocking socket I/O)
-        await conn.write_execute("INSERT INTO users (name) VALUES (?)", ["Bob"])
-        await conn.write_executescript("INSERT INTO logs VALUES (1); INSERT INTO logs VALUES (2)")
-
-        # Sync reads (fast, local) - no await needed
-        rows = conn.query_fetchall("SELECT * FROM users")
-
-        # Close async connection
-        conn.close()
-
-        # Stop server
-        server.stop()
-
-    asyncio.run(main())
 """
 
 import asyncio
@@ -87,22 +62,11 @@ from .pasyn_sqlite_core import (
     SqliteError,
     # Writer Server classes
     WriterServerHandle,
-    WriterClient,
-    HybridConnection,
-    # Native async client (GIL-releasing awaitables)
-    NativeAsyncClient,
-    NativeExecuteAwaitable,
-    native_async_client,
-    # Persistent native async client (reuses connection)
-    PersistentNativeAsyncClient,
-    PersistentNativeExecuteAwaitable,
-    persistent_native_async_client,
     # Multiplexed client (thread-safe with automatic batching)
     MultiplexedClient,
     multiplexed_client,
     # Connection functions
     connect,
-    hybrid_connect,
     # Server functions
     start_writer_server,
     default_socket_path,
@@ -128,124 +92,6 @@ from .pasyn_sqlite_core import (
 SqliteValue = Union[None, int, float, str, bytes]
 SqliteRow = Tuple[SqliteValue, ...]
 SqliteParams = Optional[Union[Sequence[SqliteValue], dict]]
-
-
-class NativeHybridConnection:
-    """
-    Hybrid connection with native awaitable writes (GIL-releasing).
-
-    - Read operations are synchronous (fast, local SQLite)
-    - Write operations use native Rust awaitables that release the GIL
-
-    This is similar to AsyncHybridConnection but uses native Rust awaitables
-    instead of Python's asyncio socket operations.
-
-    Uses a persistent socket connection for better performance.
-    """
-
-    def __init__(self, database_path: str, socket_path: str):
-        """
-        Initialize the native hybrid connection.
-
-        Args:
-            database_path: Path to the SQLite database
-            socket_path: Path to the writer server Unix socket
-        """
-        # Open read-only connection for local reads
-        self._read_conn = Connection(database_path, OpenFlags.readonly())
-        # Create persistent native async client for writes (reuses connection)
-        self._write_client = PersistentNativeAsyncClient(socket_path)
-        self._socket_path = socket_path
-
-    def close(self) -> None:
-        """Close all connections."""
-        if self._write_client:
-            self._write_client.close()
-            self._write_client = None
-        if self._read_conn:
-            self._read_conn.close()
-            self._read_conn = None
-
-    # =========================================================================
-    # Async write methods (native awaitables with GIL release)
-    # =========================================================================
-
-    async def write_execute(self, sql: str, params: SqliteParams = None) -> int:
-        """Execute a write operation (async, GIL-releasing)."""
-        result = await self._write_client.execute(sql, params)
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-        return rows_affected
-
-    async def write_execute_returning_rowid(self, sql: str, params: SqliteParams = None) -> int:
-        """Execute a write operation and return the last insert rowid (async)."""
-        result = await self._write_client.execute_returning_rowid(sql, params)
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-        return last_rowid
-
-    async def write_executescript(self, sql: str) -> None:
-        """Execute multiple SQL statements (async)."""
-        result = await self._write_client.executescript(sql)
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-
-    async def write_begin(self) -> None:
-        """Begin a transaction (async)."""
-        result = await self._write_client.begin()
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-
-    async def write_commit(self) -> None:
-        """Commit the current transaction (async)."""
-        result = await self._write_client.commit()
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-
-    async def write_rollback(self) -> None:
-        """Rollback the current transaction (async)."""
-        result = await self._write_client.rollback()
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-
-    async def write_ping(self) -> None:
-        """Ping the writer server (async)."""
-        result = await self._write_client.ping()
-        success, rows_affected, last_rowid, error_msg = result
-        if not success:
-            raise SqliteError(error_msg or "Unknown error")
-
-    # =========================================================================
-    # Sync read methods (local SQLite, fast)
-    # =========================================================================
-
-    def query_fetchall(self, sql: str, params: SqliteParams = None) -> List[SqliteRow]:
-        """Query data locally (read-only) and return all rows."""
-        return self._read_conn.execute_fetchall(sql, params)
-
-    def query_fetchone(self, sql: str, params: SqliteParams = None) -> Optional[SqliteRow]:
-        """Query data locally and return the first row."""
-        return self._read_conn.execute_fetchone(sql, params)
-
-
-def native_hybrid_connect(database_path: str, socket_path: str) -> NativeHybridConnection:
-    """
-    Create a native hybrid connection.
-
-    Args:
-        database_path: Path to the SQLite database
-        socket_path: Path to the writer server Unix socket
-
-    Returns:
-        NativeHybridConnection instance
-    """
-    return NativeHybridConnection(database_path, socket_path)
 
 
 class AsyncWriterClient:
@@ -517,18 +363,8 @@ __all__ = [
     "Cursor",
     "OpenFlags",
     "SqliteError",
-    # Writer Server classes (sync)
+    # Writer Server classes
     "WriterServerHandle",
-    "WriterClient",
-    "HybridConnection",
-    # Native async classes (GIL-releasing awaitables)
-    "NativeAsyncClient",
-    "NativeExecuteAwaitable",
-    "NativeHybridConnection",
-    # Persistent native async classes (reuses connection)
-    "PersistentNativeAsyncClient",
-    "PersistentNativeExecuteAwaitable",
-    "persistent_native_async_client",
     # Multiplexed client (thread-safe with automatic batching)
     "MultiplexedClient",
     "multiplexed_client",
@@ -537,9 +373,6 @@ __all__ = [
     "AsyncWriterClient",
     # Connection functions
     "connect",
-    "hybrid_connect",
-    "native_hybrid_connect",
-    "native_async_client",
     "async_hybrid_connect",
     "async_writer_client",
     # Server functions
