@@ -84,7 +84,7 @@ pub use value::{Params, Value};
 
 // Server/client re-exports
 pub use server::{ServerConfig, ServerHandle, WriterServer};
-pub use client::{HybridConnection, WriterClient};
+pub use client::MultiplexedClient;
 
 /// Get the SQLite library version string
 pub fn sqlite_version() -> &'static str {

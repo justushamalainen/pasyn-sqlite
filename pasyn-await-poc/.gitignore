@@ -1,9 +1,0 @@
-/target
-__pycache__
-*.pyc
-*.pyo
-*.so
-*.egg-info
-.eggs
-dist
-build
