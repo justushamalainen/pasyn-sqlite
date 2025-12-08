@@ -65,6 +65,10 @@ from .pasyn_sqlite_core import (
     # Multiplexed client (thread-safe with automatic batching)
     MultiplexedClient,
     multiplexed_client,
+    # Reader pool (Rust-side thread pool for parallel reads)
+    ReaderPool,
+    PendingQuery,
+    reader_pool,
     # Connection functions
     connect,
     # Server functions
@@ -368,6 +372,10 @@ __all__ = [
     # Multiplexed client (thread-safe with automatic batching)
     "MultiplexedClient",
     "multiplexed_client",
+    # Reader pool (Rust-side thread pool for parallel reads)
+    "ReaderPool",
+    "PendingQuery",
+    "reader_pool",
     # Async classes (asyncio socket I/O)
     "AsyncHybridConnection",
     "AsyncWriterClient",

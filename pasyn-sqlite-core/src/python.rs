@@ -11,9 +11,11 @@ use crate::connection::OpenFlags as RustOpenFlags;
 use crate::error::Error as RustError;
 use crate::server::{ServerConfig, ServerHandle, WriterServer};
 use crate::client::MultiplexedClient as RustMultiplexedClient;
+use crate::reader_pool::{ReaderPool as RustReaderPool, ReaderPoolConfig};
 use crate::value::Value as RustValue;
 
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Receiver;
 use std::path::PathBuf;
 
 // Custom exception for SQLite errors
@@ -837,6 +839,207 @@ fn multiplexed_client(socket_path: &str) -> PyResult<PyMultiplexedClient> {
     PyMultiplexedClient::new(socket_path)
 }
 
+// =============================================================================
+// Reader Pool - thread pool for read operations
+// =============================================================================
+
+/// A pending query response that can be awaited.
+///
+/// This represents a query that has been submitted to the reader pool
+/// and is waiting for a result. Use `get()` to block and retrieve the result,
+/// or `try_get()` to check without blocking.
+#[pyclass(name = "PendingQuery")]
+pub struct PyPendingQuery {
+    receiver: Option<Receiver<crate::protocol::Response>>,
+}
+
+#[pymethods]
+impl PyPendingQuery {
+    /// Block and wait for the query result.
+    ///
+    /// Returns a list of tuples (rows).
+    fn get<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyList>> {
+        let receiver = self.receiver.take().ok_or_else(|| {
+            PyRuntimeError::new_err("Query result already consumed")
+        })?;
+
+        // Release GIL while waiting
+        let response = py.allow_threads(move || {
+            receiver.recv().map_err(|_| {
+                PyRuntimeError::new_err("Channel closed")
+            })
+        })?;
+
+        if !response.is_ok() {
+            return Err(SqliteError::new_err(
+                response.error_message.unwrap_or_else(|| "Unknown error".to_string())
+            ));
+        }
+
+        // Convert rows to Python
+        let mut rows = Vec::with_capacity(response.rows.len());
+        for row in response.rows {
+            let row_values: Vec<PyObject> = row
+                .into_iter()
+                .map(|v| value_to_py(py, v))
+                .collect();
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
+        }
+
+        Ok(PyList::new_bound(py, &rows).unbind())
+    }
+
+    /// Try to get the result without blocking.
+    ///
+    /// Returns None if the result is not ready yet.
+    fn try_get<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Py<PyList>>> {
+        let receiver = match self.receiver.as_ref() {
+            Some(r) => r,
+            None => return Err(PyRuntimeError::new_err("Query result already consumed")),
+        };
+
+        match receiver.try_recv() {
+            Ok(response) => {
+                self.receiver = None;  // Mark as consumed
+
+                if !response.is_ok() {
+                    return Err(SqliteError::new_err(
+                        response.error_message.unwrap_or_else(|| "Unknown error".to_string())
+                    ));
+                }
+
+                // Convert rows to Python
+                let mut rows = Vec::with_capacity(response.rows.len());
+                for row in response.rows {
+                    let row_values: Vec<PyObject> = row
+                        .into_iter()
+                        .map(|v| value_to_py(py, v))
+                        .collect();
+                    rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
+                }
+
+                Ok(Some(PyList::new_bound(py, &rows).unbind()))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(PyRuntimeError::new_err("Channel closed"))
+            }
+        }
+    }
+
+    /// Check if the result is ready without consuming it.
+    fn is_ready(&self) -> bool {
+        // We can't really check without potentially consuming, so this is approximate
+        self.receiver.is_none()
+    }
+}
+
+/// A pool of reader threads for executing queries in parallel.
+///
+/// Each thread in the pool has its own SQLite connection, allowing true
+/// parallel read operations that bypass Python's GIL.
+#[pyclass(name = "ReaderPool")]
+pub struct PyReaderPool {
+    pool: Arc<RustReaderPool>,
+}
+
+#[pymethods]
+impl PyReaderPool {
+    /// Create a new reader pool.
+    ///
+    /// Args:
+    ///     database_path: Path to the SQLite database
+    ///     num_threads: Number of reader threads (default: 3)
+    #[new]
+    #[pyo3(signature = (database_path, num_threads=3))]
+    fn new(database_path: &str, num_threads: usize) -> PyResult<Self> {
+        let config = ReaderPoolConfig::new(database_path, num_threads);
+        let pool = RustReaderPool::new(config).map_err(to_py_err)?;
+        Ok(PyReaderPool {
+            pool: Arc::new(pool),
+        })
+    }
+
+    /// Submit a query and get a PendingQuery for the result.
+    ///
+    /// This returns immediately - the query is executed in a background thread.
+    /// Use the returned PendingQuery to get the result when ready.
+    #[pyo3(signature = (sql, params=None))]
+    fn query_async<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<PyPendingQuery> {
+        let params = extract_params(py, params)?;
+        let sql = sql.to_string();
+        let pool = self.pool.clone();
+
+        // Submit query (doesn't block)
+        let receiver = pool.query(&sql, params);
+
+        Ok(PyPendingQuery {
+            receiver: Some(receiver),
+        })
+    }
+
+    /// Execute a query and block until complete.
+    ///
+    /// This is a convenience method that submits the query and waits for the result.
+    /// The GIL is released while waiting.
+    #[pyo3(signature = (sql, params=None))]
+    fn query<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Py<PyList>> {
+        let params = extract_params(py, params)?;
+        let pool = self.pool.clone();
+
+        // Release GIL during blocking call
+        let response = py.allow_threads(move || {
+            pool.query_sync(&sql, params)
+        });
+
+        if !response.is_ok() {
+            return Err(SqliteError::new_err(
+                response.error_message.unwrap_or_else(|| "Unknown error".to_string())
+            ));
+        }
+
+        // Convert rows to Python
+        let mut rows = Vec::with_capacity(response.rows.len());
+        for row in response.rows {
+            let row_values: Vec<PyObject> = row
+                .into_iter()
+                .map(|v| value_to_py(py, v))
+                .collect();
+            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
+        }
+
+        Ok(PyList::new_bound(py, &rows).unbind())
+    }
+
+    /// Get the number of reader threads.
+    #[getter]
+    fn num_threads(&self) -> usize {
+        self.pool.num_threads()
+    }
+
+    /// Shutdown the pool.
+    fn shutdown(&self) {
+        self.pool.shutdown();
+    }
+}
+
+/// Create a reader pool (convenience function).
+#[pyfunction]
+#[pyo3(signature = (database_path, num_threads=3))]
+fn reader_pool(database_path: &str, num_threads: usize) -> PyResult<PyReaderPool> {
+    PyReaderPool::new(database_path, num_threads)
+}
+
 /// Python module
 #[pymodule]
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -851,6 +1054,10 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Multiplexed client class
     m.add_class::<PyMultiplexedClient>()?;
 
+    // Reader pool classes
+    m.add_class::<PyReaderPool>()?;
+    m.add_class::<PyPendingQuery>()?;
+
     // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;
 
@@ -858,6 +1065,7 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_writer_server, m)?)?;
     m.add_function(wrap_pyfunction!(default_socket_path, m)?)?;
     m.add_function(wrap_pyfunction!(multiplexed_client, m)?)?;
+    m.add_function(wrap_pyfunction!(reader_pool, m)?)?;
 
     // Protocol serialization functions (for async I/O)
     m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;

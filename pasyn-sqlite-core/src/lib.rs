@@ -72,6 +72,7 @@ pub mod value;
 pub mod protocol;
 pub mod server;
 pub mod client;
+pub mod reader_pool;
 
 #[cfg(feature = "python")]
 pub mod python;
@@ -85,6 +86,7 @@ pub use value::{Params, Value};
 // Server/client re-exports
 pub use server::{ServerConfig, ServerHandle, WriterServer};
 pub use client::MultiplexedClient;
+pub use reader_pool::{ReaderPool, ReaderPoolConfig};
 
 /// Get the SQLite library version string
 pub fn sqlite_version() -> &'static str {

@@ -35,6 +35,8 @@ pub enum RequestType {
     Shutdown = 8,
     /// Execute same SQL with multiple parameter sets (executemany)
     ExecuteMany = 9,
+    /// Query - execute SELECT and return rows
+    Query = 10,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -51,6 +53,7 @@ impl TryFrom<u8> for RequestType {
             7 => Ok(RequestType::Ping),
             8 => Ok(RequestType::Shutdown),
             9 => Ok(RequestType::ExecuteMany),
+            10 => Ok(RequestType::Query),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown request type: {}", value),
@@ -192,6 +195,17 @@ impl Request {
             request_type: RequestType::Shutdown,
             sql: None,
             params: Vec::new(),
+            params_batch: Vec::new(),
+        }
+    }
+
+    /// Create a query request (SELECT that returns rows)
+    pub fn query(sql: impl Into<String>, params: Vec<Value>) -> Self {
+        Request {
+            request_id: 0,
+            request_type: RequestType::Query,
+            sql: Some(sql.into()),
+            params,
             params_batch: Vec::new(),
         }
     }
@@ -346,6 +360,10 @@ pub struct Response {
     pub rows_affected: i64,
     pub last_insert_rowid: i64,
     pub error_message: Option<String>,
+    /// Column names for query results
+    pub column_names: Vec<String>,
+    /// Row data for query results (list of rows, each row is a list of values)
+    pub rows: Vec<Vec<Value>>,
 }
 
 impl Response {
@@ -357,6 +375,8 @@ impl Response {
             rows_affected,
             last_insert_rowid,
             error_message: None,
+            column_names: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
@@ -368,12 +388,27 @@ impl Response {
             rows_affected: 0,
             last_insert_rowid: 0,
             error_message: Some(message.into()),
+            column_names: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
     /// Create a simple OK response (for ping, commit, etc.)
     pub fn simple_ok() -> Self {
         Self::ok(0, 0)
+    }
+
+    /// Create a query response with rows
+    pub fn with_rows(column_names: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
+        Response {
+            request_id: 0,
+            status: ResponseStatus::Ok,
+            rows_affected: rows.len() as i64,
+            last_insert_rowid: 0,
+            error_message: None,
+            column_names,
+            rows,
+        }
     }
 
     /// Set the request ID (echoed from request)
@@ -409,6 +444,23 @@ impl Response {
             buf.extend_from_slice(msg_bytes);
         } else {
             buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+
+        // Column names
+        buf.extend_from_slice(&(self.column_names.len() as u32).to_le_bytes());
+        for name in &self.column_names {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+        }
+
+        // Rows
+        buf.extend_from_slice(&(self.rows.len() as u32).to_le_bytes());
+        for row in &self.rows {
+            buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            for value in row {
+                serialize_value(&mut buf, value);
+            }
         }
 
         buf
@@ -477,12 +529,43 @@ impl Response {
             None
         };
 
+        // Column names
+        reader.read_exact(&mut len_bytes)?;
+        let num_columns = u32::from_le_bytes(len_bytes) as usize;
+        let mut column_names = Vec::with_capacity(num_columns);
+        for _ in 0..num_columns {
+            reader.read_exact(&mut len_bytes)?;
+            let name_len = u32::from_le_bytes(len_bytes) as usize;
+            let mut name_bytes = vec![0u8; name_len];
+            reader.read_exact(&mut name_bytes)?;
+            let name = String::from_utf8(name_bytes).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e))
+            })?;
+            column_names.push(name);
+        }
+
+        // Rows
+        reader.read_exact(&mut len_bytes)?;
+        let num_rows = u32::from_le_bytes(len_bytes) as usize;
+        let mut rows = Vec::with_capacity(num_rows);
+        for _ in 0..num_rows {
+            reader.read_exact(&mut len_bytes)?;
+            let row_len = u32::from_le_bytes(len_bytes) as usize;
+            let mut row = Vec::with_capacity(row_len);
+            for _ in 0..row_len {
+                row.push(deserialize_value(reader)?);
+            }
+            rows.push(row);
+        }
+
         Ok(Response {
             request_id,
             status,
             rows_affected,
             last_insert_rowid,
             error_message,
+            column_names,
+            rows,
         })
     }
 

@@ -33,6 +33,7 @@ from implementations import (
     MainThreadSQLite,
     SingleThreadSQLite,
     MultiplexedSQLite,
+    MultiplexedWithReaderPool,
 )
 
 
@@ -879,16 +880,27 @@ def print_summary(all_results: dict[str, list[BenchmarkResult | WorkloadResult]]
 async def run_all_benchmarks(
     enable_huge_read: bool = False,
     num_read_threads: int | None = None,
+    use_reader_pool: bool = False,
 ) -> None:
     """Run all benchmarks for all implementations.
 
     Args:
         enable_huge_read: If True, also run the huge_read benchmark (~2MB data).
         num_read_threads: Number of read threads for multiplexed implementation.
-                         If None, runs both 1 and 3 read thread configurations.
+                         If None, uses default (1 for multiplexed, 3 for reader pool).
+        use_reader_pool: If True, test the multiplexed_reader_pool implementation instead.
     """
-    if num_read_threads is not None:
-        # Test specific configuration
+    if use_reader_pool:
+        # Test with reader pool (Rust-side read threads)
+        pool_threads = num_read_threads if num_read_threads is not None else 3
+        implementations = [
+            ("main_thread", MainThreadSQLite()),
+            ("single_thread", SingleThreadSQLite()),
+            ("multiplexed", MultiplexedSQLite(num_read_threads=1)),
+            (f"reader_pool_{pool_threads}rt", MultiplexedWithReaderPool(num_read_threads=pool_threads)),
+        ]
+    elif num_read_threads is not None:
+        # Test specific Python-side read thread configuration
         implementations = [
             ("main_thread", MainThreadSQLite()),
             ("single_thread", SingleThreadSQLite()),
@@ -1061,8 +1073,14 @@ if __name__ == "__main__":
         default=None,
         help="Number of read threads for multiplexed implementation (default: 1)",
     )
+    parser.add_argument(
+        "--reader-pool",
+        action="store_true",
+        help="Test with Rust-side reader pool (true parallel reads)",
+    )
     args = parser.parse_args()
     asyncio.run(run_all_benchmarks(
         enable_huge_read=args.huge_read,
         num_read_threads=args.read_threads,
+        use_reader_pool=args.reader_pool,
     ))

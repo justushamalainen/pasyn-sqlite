@@ -303,6 +303,10 @@ impl WriterServer {
                 // Handled in handle_connection
                 Response::simple_ok()
             }
+            RequestType::Query => {
+                // Query requests should go to the reader pool, not the writer server
+                Response::error("Query operations not supported on writer server - use ReaderPool instead")
+            }
         }
     }
 

@@ -311,6 +311,103 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
             self._server = None
 
 
+class MultiplexedWithReaderPool(BaseSQLiteImplementation):
+    """
+    Multiplexed client with Rust-side reader thread pool.
+
+    This implementation:
+    - Uses the writer server for all write operations
+    - Uses a Rust-side reader pool for read operations
+    - True parallel reads in Rust threads (bypasses Python GIL)
+    - Each reader thread has its own SQLite connection
+    """
+
+    def __init__(self, num_read_threads: int = 3) -> None:
+        self._server: pasyn_sqlite_core.WriterServerHandle | None = None
+        self._client: pasyn_sqlite_core.MultiplexedClient | None = None
+        self._reader_pool: pasyn_sqlite_core.ReaderPool | None = None
+        self._db_path: str | None = None
+        self._in_transaction: bool = False
+        self._num_read_threads = num_read_threads
+        self._pending_commit: bool = False  # Track if a commit is pending after executescript
+
+    async def setup(self, db_path: str) -> None:
+        self._db_path = db_path
+        # Start writer server
+        self._server = pasyn_sqlite_core.start_writer_server(db_path)
+        # Create multiplexed client for writes
+        self._client = pasyn_sqlite_core.MultiplexedClient(self._server.socket_path)
+        # Create reader pool for reads
+        self._reader_pool = pasyn_sqlite_core.ReaderPool(db_path, self._num_read_threads)
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._client is not None
+        assert self._reader_pool is not None
+        sql_lower = sql.strip().upper()
+        if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
+            # Read operation - use reader pool (releases GIL during execution)
+            return self._reader_pool.query(sql, list(parameters))
+        else:
+            # Write operation - use multiplexed client
+            self._client.execute(sql, list(parameters))
+            return []
+
+    async def executemany(
+        self, sql: str, parameters: Sequence[Sequence[Any]]
+    ) -> None:
+        assert self._client is not None
+        self._client.execute_many(sql, [list(p) for p in parameters])
+
+    async def executescript(self, script: str) -> None:
+        assert self._client is not None
+        self._client.executescript(script)
+        # executescript auto-commits, so mark that we shouldn't commit again
+        self._pending_commit = True
+
+    async def begin_transaction(self) -> None:
+        assert self._client is not None
+        self._in_transaction = True
+        self._pending_commit = False
+        self._client.begin()
+
+    async def commit(self) -> None:
+        assert self._client is not None
+        # Skip commit if executescript already committed
+        if self._pending_commit:
+            self._pending_commit = False
+            return
+        if self._in_transaction:
+            self._in_transaction = False
+            self._client.commit()
+
+    async def rollback(self) -> None:
+        assert self._client is not None
+        self._in_transaction = False
+        self._pending_commit = False
+        self._client.rollback()
+
+    async def run_in_transaction(
+        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+    ) -> None:
+        """Run operations within a transaction."""
+        await self.begin_transaction()
+        try:
+            await operations(self)
+            await self.commit()
+        except Exception:
+            await self.rollback()
+            raise
+
+    async def close(self) -> None:
+        if self._reader_pool:
+            self._reader_pool.shutdown()
+            self._reader_pool = None
+        self._client = None
+        if self._server:
+            self._server.stop()
+            self._server = None
+
+
 # Factory function
 def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
@@ -318,6 +415,7 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
         "main_thread": MainThreadSQLite,
         "single_thread": SingleThreadSQLite,
         "multiplexed": MultiplexedSQLite,
+        "multiplexed_reader_pool": MultiplexedWithReaderPool,
     }
     if name not in implementations:
         raise ValueError(f"Unknown implementation: {name}")
