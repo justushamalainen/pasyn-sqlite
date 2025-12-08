@@ -876,17 +876,31 @@ def print_summary(all_results: dict[str, list[BenchmarkResult | WorkloadResult]]
                         )
 
 
-async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
+async def run_all_benchmarks(
+    enable_huge_read: bool = False,
+    num_read_threads: int | None = None,
+) -> None:
     """Run all benchmarks for all implementations.
 
     Args:
         enable_huge_read: If True, also run the huge_read benchmark (~2MB data).
+        num_read_threads: Number of read threads for multiplexed implementation.
+                         If None, runs both 1 and 3 read thread configurations.
     """
-    implementations = [
-        ("main_thread", MainThreadSQLite()),
-        ("single_thread", SingleThreadSQLite()),
-        ("multiplexed", MultiplexedSQLite()),
-    ]
+    if num_read_threads is not None:
+        # Test specific configuration
+        implementations = [
+            ("main_thread", MainThreadSQLite()),
+            ("single_thread", SingleThreadSQLite()),
+            (f"multiplexed_{num_read_threads}rt", MultiplexedSQLite(num_read_threads=num_read_threads)),
+        ]
+    else:
+        # Default: just use 1 read thread (original behavior)
+        implementations = [
+            ("main_thread", MainThreadSQLite()),
+            ("single_thread", SingleThreadSQLite()),
+            ("multiplexed", MultiplexedSQLite(num_read_threads=1)),
+        ]
 
     all_results: dict[str, list[BenchmarkResult | WorkloadResult]] = {}
 
@@ -1041,5 +1055,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable the huge_read benchmark (~2MB data read)",
     )
+    parser.add_argument(
+        "--read-threads",
+        type=int,
+        default=None,
+        help="Number of read threads for multiplexed implementation (default: 1)",
+    )
     args = parser.parse_args()
-    asyncio.run(run_all_benchmarks(enable_huge_read=args.huge_read))
+    asyncio.run(run_all_benchmarks(
+        enable_huge_read=args.huge_read,
+        num_read_threads=args.read_threads,
+    ))

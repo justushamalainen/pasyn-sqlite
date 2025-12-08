@@ -212,15 +212,18 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
     - Automatically batches concurrent requests
     - Lock-free request submission (minimal contention)
     - Releases GIL during I/O operations
-    - Uses local SQLite connection for reads (sync, fast)
+    - Uses local SQLite connection(s) for reads (sync, fast)
+    - Supports configurable number of read threads for parallel reads
     """
 
-    def __init__(self) -> None:
+    def __init__(self, num_read_threads: int = 1) -> None:
         self._server: pasyn_sqlite_core.WriterServerHandle | None = None
         self._client: pasyn_sqlite_core.MultiplexedClient | None = None
-        self._read_conn: pasyn_sqlite_core.Connection | None = None
+        self._read_conns: list[pasyn_sqlite_core.Connection] = []
         self._db_path: str | None = None
         self._in_transaction: bool = False
+        self._num_read_threads = num_read_threads
+        self._read_conn_index = 0  # Round-robin index
 
     async def setup(self, db_path: str) -> None:
         self._db_path = db_path
@@ -228,18 +231,28 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         self._server = pasyn_sqlite_core.start_writer_server(db_path)
         # Create multiplexed client for writes
         self._client = pasyn_sqlite_core.MultiplexedClient(self._server.socket_path)
-        # Create local read-only connection for reads
-        self._read_conn = pasyn_sqlite_core.connect(
-            db_path, pasyn_sqlite_core.OpenFlags.readonly()
-        )
+        # Create pool of read-only connections for reads
+        self._read_conns = []
+        for _ in range(self._num_read_threads):
+            conn = pasyn_sqlite_core.connect(
+                db_path, pasyn_sqlite_core.OpenFlags.readonly()
+            )
+            self._read_conns.append(conn)
+
+    def _get_read_conn(self) -> pasyn_sqlite_core.Connection:
+        """Get next read connection using round-robin."""
+        conn = self._read_conns[self._read_conn_index]
+        self._read_conn_index = (self._read_conn_index + 1) % len(self._read_conns)
+        return conn
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
         assert self._client is not None
-        assert self._read_conn is not None
+        assert self._read_conns
         sql_lower = sql.strip().upper()
         if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
-            # Read operation - use local connection (sync)
-            return self._read_conn.execute_fetchall(sql, list(parameters))
+            # Read operation - use local connection (sync) from pool
+            read_conn = self._get_read_conn()
+            return read_conn.execute_fetchall(sql, list(parameters))
         else:
             # Write operation - use multiplexed client
             # Note: this is synchronous but releases GIL during I/O
@@ -289,9 +302,9 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
             raise
 
     async def close(self) -> None:
-        if self._read_conn:
-            self._read_conn.close()
-            self._read_conn = None
+        for conn in self._read_conns:
+            conn.close()
+        self._read_conns = []
         self._client = None  # No explicit close needed
         if self._server:
             self._server.stop()
@@ -301,7 +314,7 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
 # Factory function
 def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
-    implementations = {
+    implementations: dict[str, type[BaseSQLiteImplementation]] = {
         "main_thread": MainThreadSQLite,
         "single_thread": SingleThreadSQLite,
         "multiplexed": MultiplexedSQLite,
