@@ -167,7 +167,8 @@ impl WriterServer {
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // No connection available, sleep briefly and try again
-                    thread::sleep(std::time::Duration::from_millis(10));
+                    // Using 1ms for lower latency (was 10ms)
+                    thread::sleep(std::time::Duration::from_millis(1));
                 }
                 Err(e) => {
                     if !self.is_shutdown() {
@@ -212,7 +213,9 @@ impl WriterServer {
             }
 
             // Process request and echo back request_id
-            let response = self.process_request(conn, &request).with_id(request.request_id);
+            // Note: process_request takes &mut to avoid cloning params
+            let request_id = request.request_id;
+            let response = self.process_request(conn, request).with_id(request_id);
 
             // Send response
             write_message(&mut writer, &response.serialize())?;
@@ -222,11 +225,13 @@ impl WriterServer {
     }
 
     /// Process a single request
-    fn process_request(&self, conn: &Connection, request: &Request) -> Response {
+    /// Takes ownership of request to avoid cloning params
+    fn process_request(&self, conn: &Connection, mut request: Request) -> Response {
         match request.request_type {
             RequestType::Execute => {
                 if let Some(ref sql) = request.sql {
-                    match conn.execute(sql, request.params.clone()) {
+                    // Take ownership of params to avoid clone
+                    match conn.execute(sql, std::mem::take(&mut request.params)) {
                         Ok(rows) => Response::ok(rows as i64, conn.last_insert_rowid()),
                         Err(e) => Response::error(e.to_string()),
                     }
@@ -236,7 +241,8 @@ impl WriterServer {
             }
             RequestType::ExecuteReturningRowId => {
                 if let Some(ref sql) = request.sql {
-                    match conn.execute(sql, request.params.clone()) {
+                    // Take ownership of params to avoid clone
+                    match conn.execute(sql, std::mem::take(&mut request.params)) {
                         Ok(rows) => Response::ok(rows as i64, conn.last_insert_rowid()),
                         Err(e) => Response::error(e.to_string()),
                     }
@@ -246,13 +252,15 @@ impl WriterServer {
             }
             RequestType::ExecuteMany => {
                 if let Some(ref sql) = request.sql {
+                    // Take ownership of params_batch to avoid clone
+                    let params_batch = std::mem::take(&mut request.params_batch);
                     // Wrap in transaction for efficiency (prevents auto-commit per row)
                     if conn.is_autocommit() {
                         // Start implicit transaction
                         if let Err(e) = conn.execute_batch("BEGIN") {
                             return Response::error(e.to_string());
                         }
-                        let result = conn.execute_many(sql, request.params_batch.clone());
+                        let result = conn.execute_many(sql, params_batch);
                         // Commit the transaction
                         if let Err(e) = conn.execute_batch("COMMIT") {
                             let _ = conn.execute_batch("ROLLBACK");
@@ -267,7 +275,7 @@ impl WriterServer {
                         }
                     } else {
                         // Already in a transaction, just execute
-                        match conn.execute_many(sql, request.params_batch.clone()) {
+                        match conn.execute_many(sql, params_batch) {
                             Ok(rows) => Response::ok(rows as i64, conn.last_insert_rowid()),
                             Err(e) => Response::error(e.to_string()),
                         }

@@ -14,6 +14,11 @@ from typing import Any, Callable, Coroutine, Sequence
 import pasyn_sqlite_core
 
 
+def _ensure_list(seq: Sequence[Any]) -> list[Any]:
+    """Convert to list only if necessary, avoiding copy if already a list."""
+    return seq if isinstance(seq, list) else list(seq)
+
+
 class BaseSQLiteImplementation(ABC):
     """Base class for SQLite implementations."""
 
@@ -236,14 +241,16 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
         assert self._client is not None
         assert self._read_conn is not None
-        sql_lower = sql.strip().upper()
-        if sql_lower.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
+        # Only check first 7 chars (enough for longest keyword "EXPLAIN")
+        # Avoids allocating full uppercase copy of entire SQL string
+        sql_start = sql.lstrip()[:7].upper()
+        if sql_start.startswith(("SELECT", "PRAGMA", "EXPLAIN", "WITH")):
             # Read operation - use local connection (sync)
-            return self._read_conn.execute_fetchall(sql, list(parameters))
+            return self._read_conn.execute_fetchall(sql, _ensure_list(parameters))
         else:
             # Write operation - use multiplexed client
             # Note: this is synchronous but releases GIL during I/O
-            self._client.execute(sql, list(parameters))
+            self._client.execute(sql, _ensure_list(parameters))
             return []
 
     async def executemany(
@@ -253,7 +260,8 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         # Use execute_many for efficient batched execution
         # This sends all parameters in a single request
         # The server wraps this in a transaction automatically for efficiency
-        self._client.execute_many(sql, [list(p) for p in parameters])
+        # Only convert inner sequences to lists if they aren't already
+        self._client.execute_many(sql, [_ensure_list(p) for p in parameters])
 
     async def commit(self) -> None:
         assert self._client is not None

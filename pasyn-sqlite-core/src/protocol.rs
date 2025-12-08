@@ -204,7 +204,16 @@ impl Request {
 
     /// Serialize the request to bytes
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Pre-allocate buffer with estimated size:
+        // - Header: 14 bytes (magic 4 + version 1 + request_id 8 + type 1)
+        // - SQL length: 4 bytes + SQL string
+        // - Params: 4 bytes + ~16 bytes per param (estimate)
+        // - Params batch: 4 bytes + params
+        let sql_len = self.sql.as_ref().map_or(0, |s| s.len());
+        let params_estimate = self.params.len() * 16;
+        let batch_estimate = self.params_batch.iter().map(|p| 4 + p.len() * 16).sum::<usize>();
+        let estimated_size = 22 + sql_len + params_estimate + batch_estimate;
+        let mut buf = Vec::with_capacity(estimated_size);
 
         // Magic + version
         buf.extend_from_slice(PROTOCOL_MAGIC);
@@ -384,7 +393,12 @@ impl Response {
 
     /// Serialize the response to bytes
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Pre-allocate buffer with estimated size:
+        // - Header: 22 bytes (magic 4 + version 1 + request_id 8 + status 1 + rows 8)
+        // - Last insert rowid: 8 bytes
+        // - Error message length: 4 bytes + message
+        let msg_len = self.error_message.as_ref().map_or(0, |m| m.len());
+        let mut buf = Vec::with_capacity(34 + msg_len);
 
         // Magic + version
         buf.extend_from_slice(PROTOCOL_MAGIC);
