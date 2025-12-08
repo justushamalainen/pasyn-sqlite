@@ -17,7 +17,7 @@ Warning = sqlite3.Warning
 
 
 class PoolError(Exception):
-    """Base exception for thread pool errors."""
+    """Base exception for connection pool errors."""
 
     pass
 

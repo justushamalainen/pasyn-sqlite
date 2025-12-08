@@ -1,14 +1,14 @@
 # pasyn-sqlite
 
-Async SQLite with thread pool - single writer, multiple readers with work stealing.
+High-performance async SQLite with multiplexed writes and synchronous reads.
 
 ## Features
 
-- **Single Writer Thread**: All write operations (INSERT, UPDATE, DELETE, etc.) are serialized through a dedicated writer thread, ensuring SQLite's write consistency.
-- **Multiple Reader Threads**: Configurable number of reader threads (default: 3) handle SELECT queries concurrently.
-- **Work Stealing**: Reader threads use a work-stealing algorithm for load balancing - idle readers steal tasks from busy readers.
-- **Async/Await API**: Mirrors the standard library `sqlite3` interface but with async methods.
-- **WAL Mode**: Automatically enables WAL journal mode for better concurrent performance.
+- **Single Writer Thread**: All write operations (INSERT, UPDATE, DELETE, etc.) are serialized through a dedicated writer server via Unix socket, ensuring SQLite's write consistency.
+- **Synchronous Reads**: Read operations execute directly on a local read-only connection in the main thread - fast and efficient with no thread pool overhead.
+- **Multiplexed Client**: Thread-safe client with automatic request batching for efficient write operations.
+- **WAL Mode**: Uses WAL journal mode for better concurrent read/write performance.
+- **Rust Core**: High-performance Rust implementation with Python bindings via PyO3.
 
 ## Installation
 
@@ -25,116 +25,122 @@ pip install -e ".[dev]"
 ## Quick Start
 
 ```python
-import asyncio
-import pasyn_sqlite
+import pasyn_sqlite_core as sqlite
 
-async def main():
-    # Connect to database (creates file if it doesn't exist)
-    async with await pasyn_sqlite.connect("mydb.sqlite") as conn:
-        # Create a table (write operation -> goes to writer thread)
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                email TEXT
-            )
-        ''')
-        await conn.commit()
+# Start writer server for write operations
+server = sqlite.start_writer_server("mydb.sqlite")
 
-        # Insert data (write operation -> goes to writer thread)
-        await conn.execute(
-            "INSERT INTO users (name, email) VALUES (?, ?)",
-            ("Alice", "alice@example.com")
-        )
-        await conn.commit()
+# Create multiplexed client for writes
+client = sqlite.MultiplexedClient(server.socket_path)
 
-        # Query data (read operation -> goes to reader thread pool)
-        cursor = await conn.execute("SELECT * FROM users")
-        rows = await cursor.fetchall()
-        print(rows)
+# Create local read-only connection for reads
+read_conn = sqlite.connect("mydb.sqlite", sqlite.OpenFlags.readonly())
 
-asyncio.run(main())
+# Create a table (write operation -> goes to writer server)
+client.executescript('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        email TEXT
+    )
+''')
+
+# Insert data (write operation -> goes to writer server)
+client.execute(
+    "INSERT INTO users (name, email) VALUES (?, ?)",
+    ["Alice", "alice@example.com"]
+)
+
+# Query data (read operation -> synchronous, main thread)
+rows = read_conn.execute_fetchall("SELECT * FROM users")
+print(rows)  # [(1, 'Alice', 'alice@example.com')]
+
+# Clean up
+read_conn.close()
+server.stop()
 ```
 
 ## API Reference
 
-### `connect(database, *, num_readers=3, **kwargs)`
+### Writer Server
 
-Create an async database connection.
+#### `start_writer_server(database_path, socket_path=None)`
 
-- `database`: Path to SQLite database file or `:memory:` for in-memory database
-- `num_readers`: Number of reader threads (default: 3)
-- `**kwargs`: Additional arguments passed to `sqlite3.connect()`
+Start a writer server that handles all write operations via Unix socket.
 
-### `Connection`
+- `database_path`: Path to SQLite database file
+- `socket_path`: Optional path for Unix socket (auto-generated if not specified)
 
-Async connection that mirrors `sqlite3.Connection`:
+Returns a `WriterServerHandle` with methods:
+- `socket_path` - Get the socket path
+- `shutdown()` - Signal server to stop
+- `join()` - Wait for server to stop
+- `stop()` - Shutdown and wait
 
-- `await conn.execute(sql, parameters=())` - Execute SQL and return cursor
-- `await conn.executemany(sql, parameters)` - Execute SQL with multiple parameter sets
-- `await conn.executescript(script)` - Execute multiple SQL statements
-- `await conn.commit()` - Commit current transaction
-- `await conn.rollback()` - Rollback current transaction
-- `await conn.close()` - Close the connection
-- `await conn.cursor()` - Create a new cursor
+### Connection (for reads)
 
-### `Cursor`
+#### `connect(path, flags=None)`
 
-Async cursor that mirrors `sqlite3.Cursor`:
+Open a SQLite database connection for read operations.
 
-- `await cursor.execute(sql, parameters=())` - Execute SQL
-- `await cursor.executemany(sql, parameters)` - Execute with multiple parameter sets
-- `await cursor.fetchone()` - Fetch next row
-- `await cursor.fetchmany(size=None)` - Fetch next `size` rows
-- `await cursor.fetchall()` - Fetch all remaining rows
-- `cursor.description` - Column descriptions
-- `cursor.rowcount` - Number of affected rows
-- `cursor.lastrowid` - Last inserted row ID
+- `path`: Path to SQLite database file
+- `flags`: Optional `OpenFlags` (use `OpenFlags.readonly()` for read-only)
 
-### Async Iteration
+Returns a `Connection` with methods:
+- `execute(sql, params=None)` - Execute SQL and return rows affected
+- `execute_fetchall(sql, params=None)` - Execute SQL and return all rows
+- `execute_fetchone(sql, params=None)` - Execute SQL and return first row
+- `executescript(sql)` - Execute multiple SQL statements
+- `begin()` / `commit()` / `rollback()` - Transaction control
+- `close()` - Close the connection
 
-Cursors support async iteration:
+### MultiplexedClient (for writes)
 
-```python
-cursor = await conn.execute("SELECT * FROM users")
-async for row in cursor:
-    print(row)
-```
+#### `MultiplexedClient(socket_path)`
 
-### Context Managers
+Thread-safe client for sending write operations to the writer server.
 
-Both connections and cursors work as async context managers:
+- `socket_path`: Path to writer server Unix socket
 
-```python
-async with await pasyn_sqlite.connect("db.sqlite") as conn:
-    async with await conn.execute("SELECT 1") as cursor:
-        row = await cursor.fetchone()
-```
+Methods:
+- `execute(sql, params=None)` - Execute SQL statement
+- `execute_returning_rowid(sql, params=None)` - Execute and return last rowid
+- `execute_many(sql, params_batch)` - Execute with multiple parameter sets
+- `executescript(sql)` - Execute multiple SQL statements
+- `begin()` / `commit()` / `rollback()` - Transaction control
+- `ping()` - Check server is alive
+- `shutdown_server()` - Request server shutdown
 
 ## Architecture
 
 ```
                     ┌─────────────────────┐
-                    │    Your Async Code  │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │    pasyn_sqlite     │
-                    │   Connection/Cursor │
+                    │     Your Code       │
                     └──────────┬──────────┘
                                │
               ┌────────────────┴────────────────┐
               │                                 │
     ┌─────────▼─────────┐           ┌──────────▼──────────┐
-    │   Writer Thread   │           │   Reader Pool       │
-    │   (single)        │           │   (configurable)    │
+    │ MultiplexedClient │           │  Local Connection   │
+    │   (for writes)    │           │   (for reads)       │
     │                   │           │                     │
-    │  - INSERT         │           │  Reader 0 ◄──┐      │
-    │  - UPDATE         │           │  Reader 1 ◄──┼─ Work│
-    │  - DELETE         │           │  Reader 2 ◄──┘  Stealing
-    │  - CREATE/DROP    │           │                     │
-    │  - COMMIT/ROLLBACK│           │  SELECT queries     │
+    │  Thread-safe      │           │  Read-only          │
+    │  Auto-batching    │           │  Synchronous        │
+    │  GIL-releasing    │           │  Main thread        │
     └─────────┬─────────┘           └──────────┬──────────┘
+              │                                 │
+              │ Unix Socket                     │ Direct
+              │                                 │
+    ┌─────────▼─────────┐                       │
+    │   Writer Server   │                       │
+    │   (single thread) │                       │
+    │                   │                       │
+    │  - INSERT         │                       │
+    │  - UPDATE         │                       │
+    │  - DELETE         │                       │
+    │  - CREATE/DROP    │                       │
+    │  - COMMIT/ROLLBACK│                       │
+    └─────────┬─────────┘                       │
               │                                 │
               └────────────────┬────────────────┘
                                │
@@ -144,35 +150,26 @@ async with await pasyn_sqlite.connect("db.sqlite") as conn:
                     └─────────────────────┘
 ```
 
-## Work Stealing
-
-When a reader thread's local queue is empty, it attempts to steal work from other readers before checking the shared queue. This ensures better load distribution and reduces idle time.
-
-```
-Reader 0: [Task A, Task B, Task C]  ◄── Owner takes from front
-Reader 1: [Task D]
-Reader 2: []  ─────────────────────────► Steals from back of Reader 0's queue
-```
-
 ## Thread Safety
 
-- Write operations are always serialized through the single writer thread
-- Read operations can run concurrently across multiple reader threads
-- SQLite WAL mode allows concurrent reads even during writes
-- All connection setup includes `busy_timeout` to handle temporary locks
+- **Write operations**: Serialized through the single writer server thread
+- **Read operations**: Execute synchronously on the calling thread via local read-only connection
+- **SQLite WAL mode**: Allows concurrent reads even during writes
+- **MultiplexedClient**: Thread-safe with lock-free request submission and automatic batching
 
 ## Exceptions
 
 `pasyn_sqlite` re-exports all `sqlite3` exceptions and adds:
 
-- `PoolError` - Base exception for pool errors
-- `PoolClosedError` - Pool has been closed
+- `SqliteError` - Base exception for SQLite errors (from Rust bindings)
+- `PoolError` - Base exception for connection pool errors
+- `PoolClosedError` - Connection pool has been closed
 - `ConnectionClosedError` - Connection has been closed
 
 ## Requirements
 
 - Python 3.9+
-- No external dependencies (uses only standard library)
+- Rust toolchain (for building from source)
 
 ## License
 

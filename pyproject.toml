@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pasyn-sqlite"
 version = "0.1.0"
-description = "Async SQLite with thread pool - single writer, multiple readers with work stealing"
+description = "High-performance async SQLite with multiplexed writes and synchronous reads"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "pasyn-sqlite contributors"}
 ]
-keywords = ["sqlite", "async", "asyncio", "database", "thread-pool"]
+keywords = ["sqlite", "async", "asyncio", "database", "rust"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -2,7 +2,7 @@
 name = "pasyn-sqlite-core"
 version = "0.1.0"
 edition = "2021"
-description = "SQLite bindings for pasyn - async SQLite with thread pool"
+description = "SQLite bindings for pasyn - high-performance async SQLite with multiplexed writes"
 license = "MIT"
 repository = "https://github.com/pasyn/pasyn-sqlite"
 keywords = ["sqlite", "database", "ffi", "python", "async"]
