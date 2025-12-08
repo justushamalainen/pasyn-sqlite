@@ -13,7 +13,7 @@ use crate::server::{ServerConfig, ServerHandle, WriterServer};
 use crate::client::MultiplexedClient as RustMultiplexedClient;
 use crate::value::Value as RustValue;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::path::PathBuf;
 
 // Custom exception for SQLite errors
@@ -148,9 +148,10 @@ impl PyOpenFlags {
 }
 
 /// A SQLite database connection
+/// No Mutex needed - SQLite handles synchronization internally (THREADSAFE=1)
 #[pyclass(name = "Connection")]
 pub struct PyConnection {
-    conn: Arc<Mutex<RustConnection>>,
+    conn: Arc<RustConnection>,
 }
 
 #[pymethods]
@@ -162,7 +163,7 @@ impl PyConnection {
         let flags = flags.map(|f| RustOpenFlags::from_bits(f.flags)).unwrap_or_default();
         let conn = RustConnection::open_with_flags(path, flags).map_err(to_py_err)?;
         Ok(PyConnection {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(conn),
         })
     }
 
@@ -171,7 +172,7 @@ impl PyConnection {
     fn memory() -> PyResult<Self> {
         let conn = RustConnection::open_in_memory().map_err(to_py_err)?;
         Ok(PyConnection {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(conn),
         })
     }
 
@@ -180,7 +181,7 @@ impl PyConnection {
     fn shared_memory(name: &str) -> PyResult<Self> {
         let conn = RustConnection::open_shared_memory(name).map_err(to_py_err)?;
         Ok(PyConnection {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(conn),
         })
     }
 
@@ -193,14 +194,12 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<usize> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.execute(sql, params).map_err(to_py_err)
+        self.conn.execute(sql, params).map_err(to_py_err)
     }
 
     /// Execute multiple SQL statements
     fn executescript(&self, sql: &str) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.execute_batch(sql).map_err(to_py_err)
+        self.conn.execute_batch(sql).map_err(to_py_err)
     }
 
     /// Execute SQL and return all rows
@@ -212,8 +211,7 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyList>> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(sql, params).map_err(to_py_err)?;
+        let mut stmt = self.conn.query(sql, params).map_err(to_py_err)?;
 
         let mut rows = Vec::new();
         while stmt.step().map_err(to_py_err)? {
@@ -235,8 +233,7 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Py<PyTuple>>> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(sql, params).map_err(to_py_err)?;
+        let mut stmt = self.conn.query(sql, params).map_err(to_py_err)?;
 
         if stmt.step().map_err(to_py_err)? {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
@@ -257,9 +254,7 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<PyCursor> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-
-        let stmt = conn.prepare(sql).map_err(to_py_err)?;
+        let stmt = self.conn.prepare(sql).map_err(to_py_err)?;
         let column_names: Vec<String> = (0..stmt.column_count())
             .filter_map(|i| stmt.column_name(i).map(String::from))
             .collect();
@@ -275,68 +270,56 @@ impl PyConnection {
 
     /// Begin a transaction
     fn begin(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.execute_batch("BEGIN").map_err(to_py_err)
+        self.conn.execute_batch("BEGIN").map_err(to_py_err)
     }
 
     /// Commit the current transaction
     fn commit(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.execute_batch("COMMIT").map_err(to_py_err)
+        self.conn.execute_batch("COMMIT").map_err(to_py_err)
     }
 
     /// Rollback the current transaction
     fn rollback(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.execute_batch("ROLLBACK").map_err(to_py_err)
+        self.conn.execute_batch("ROLLBACK").map_err(to_py_err)
     }
 
     /// Check if in autocommit mode
     #[getter]
-    fn in_transaction(&self) -> PyResult<bool> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        Ok(!conn.is_autocommit())
+    fn in_transaction(&self) -> bool {
+        !self.conn.is_autocommit()
     }
 
     /// Get the last inserted row ID
     #[getter]
-    fn last_insert_rowid(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        Ok(conn.last_insert_rowid())
+    fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
     }
 
     /// Get the number of rows changed
     #[getter]
-    fn changes(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        Ok(conn.changes())
+    fn changes(&self) -> i64 {
+        self.conn.changes()
     }
 
     /// Get total changes since connection opened
     #[getter]
-    fn total_changes(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        Ok(conn.total_changes())
+    fn total_changes(&self) -> i64 {
+        self.conn.total_changes()
     }
 
     /// Set busy timeout in milliseconds
     fn set_busy_timeout(&self, ms: i32) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.busy_timeout(ms).map_err(to_py_err)
+        self.conn.busy_timeout(ms).map_err(to_py_err)
     }
 
     /// Interrupt any pending operation
-    fn interrupt(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        conn.interrupt();
-        Ok(())
+    fn interrupt(&self) {
+        self.conn.interrupt();
     }
 
     /// Close the connection
     fn close(&self) -> PyResult<()> {
         // The actual close happens when the Arc is dropped
-        // For now, just verify we can get the lock
-        let _conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(())
     }
 
@@ -356,9 +339,10 @@ impl PyConnection {
 }
 
 /// A database cursor for iterating over query results
+/// No Mutex needed - SQLite handles synchronization internally (THREADSAFE=1)
 #[pyclass(name = "Cursor")]
 pub struct PyCursor {
-    conn: Arc<Mutex<RustConnection>>,
+    conn: Arc<RustConnection>,
     sql: String,
     params: Vec<RustValue>,
     column_names: Vec<String>,
@@ -379,8 +363,7 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
 
         let mut rows = Vec::new();
         while stmt.step().map_err(to_py_err)? {
@@ -399,8 +382,7 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
 
         if stmt.step().map_err(to_py_err)? {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
@@ -421,8 +403,7 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
 
         let mut rows = Vec::new();
         let mut count = 0;

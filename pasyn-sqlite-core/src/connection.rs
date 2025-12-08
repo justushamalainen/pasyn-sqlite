@@ -80,9 +80,13 @@ pub struct Connection {
     db: *mut ffi::sqlite3,
 }
 
-// Safety: SQLite is thread-safe when compiled with SQLITE_THREADSAFE=1
-// (which is the default and what we require)
+// SAFETY: SQLite is compiled with SQLITE_THREADSAFE=1 (serialized mode).
+// This means SQLite internally serializes all API calls using its own mutexes,
+// making it safe to:
+// - Move connections between threads (Send)
+// - Share connections between threads (Sync) - SQLite handles synchronization
 unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
 impl Connection {
     /// Open a database connection to a file path
