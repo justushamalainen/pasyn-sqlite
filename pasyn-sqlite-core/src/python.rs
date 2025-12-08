@@ -186,6 +186,7 @@ impl PyConnection {
     }
 
     /// Execute a SQL statement
+    /// Releases GIL during SQLite operation for better multi-threaded performance
     #[pyo3(signature = (sql, params=None))]
     fn execute<'py>(
         &self,
@@ -194,15 +195,21 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<usize> {
         let params = extract_params(py, params)?;
-        self.conn.execute(sql, params).map_err(to_py_err)
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        py.allow_threads(move || conn.execute(&sql, params).map_err(to_py_err))
     }
 
     /// Execute multiple SQL statements
-    fn executescript(&self, sql: &str) -> PyResult<()> {
-        self.conn.execute_batch(sql).map_err(to_py_err)
+    /// Releases GIL during SQLite operation
+    fn executescript(&self, py: Python<'_>, sql: &str) -> PyResult<()> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        py.allow_threads(move || conn.execute_batch(&sql).map_err(to_py_err))
     }
 
     /// Execute SQL and return all rows
+    /// Releases GIL during SQLite operation, then converts results to Python
     #[pyo3(signature = (sql, params=None))]
     fn execute_fetchall<'py>(
         &self,
@@ -211,20 +218,36 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyList>> {
         let params = extract_params(py, params)?;
-        let mut stmt = self.conn.query(sql, params).map_err(to_py_err)?;
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
 
-        let mut rows = Vec::new();
-        while stmt.step().map_err(to_py_err)? {
-            let row_values: Vec<PyObject> = (0..stmt.column_count())
-                .map(|i| value_to_py(py, stmt.column_value(i)))
-                .collect();
-            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
-        }
+        // Release GIL during SQLite work, collect as Rust values
+        let rust_rows: Vec<Vec<RustValue>> = py.allow_threads(move || {
+            let mut stmt = conn.query(&sql, params)?;
+            let mut rows = Vec::new();
+            while stmt.step()? {
+                let row: Vec<RustValue> = (0..stmt.column_count())
+                    .map(|i| stmt.column_value(i))
+                    .collect();
+                rows.push(row);
+            }
+            Ok::<_, RustError>(rows)
+        }).map_err(to_py_err)?;
 
-        Ok(PyList::new_bound(py, &rows).unbind())
+        // Convert to Python (needs GIL, but fast)
+        let py_rows: Vec<PyObject> = rust_rows
+            .into_iter()
+            .map(|row| {
+                let values: Vec<PyObject> = row.into_iter().map(|v| value_to_py(py, v)).collect();
+                PyTuple::new_bound(py, &values).into_any().unbind()
+            })
+            .collect();
+
+        Ok(PyList::new_bound(py, &py_rows).unbind())
     }
 
     /// Execute SQL and return the first row
+    /// Releases GIL during SQLite operation
     #[pyo3(signature = (sql, params=None))]
     fn execute_fetchone<'py>(
         &self,
@@ -233,19 +256,31 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Py<PyTuple>>> {
         let params = extract_params(py, params)?;
-        let mut stmt = self.conn.query(sql, params).map_err(to_py_err)?;
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
 
-        if stmt.step().map_err(to_py_err)? {
-            let row_values: Vec<PyObject> = (0..stmt.column_count())
-                .map(|i| value_to_py(py, stmt.column_value(i)))
-                .collect();
-            Ok(Some(PyTuple::new_bound(py, &row_values).unbind()))
-        } else {
-            Ok(None)
-        }
+        // Release GIL during SQLite work
+        let rust_row: Option<Vec<RustValue>> = py.allow_threads(move || {
+            let mut stmt = conn.query(&sql, params)?;
+            if stmt.step()? {
+                let row: Vec<RustValue> = (0..stmt.column_count())
+                    .map(|i| stmt.column_value(i))
+                    .collect();
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
+        }).map_err(to_py_err)?;
+
+        // Convert to Python
+        Ok(rust_row.map(|row| {
+            let values: Vec<PyObject> = row.into_iter().map(|v| value_to_py(py, v)).collect();
+            PyTuple::new_bound(py, &values).unbind()
+        }))
     }
 
     /// Create a cursor for iterating over results
+    /// Pre-fetches all rows to avoid re-preparing on each fetch
     #[pyo3(signature = (sql, params=None))]
     fn cursor<'py>(
         &self,
@@ -254,17 +289,34 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<PyCursor> {
         let params = extract_params(py, params)?;
-        let stmt = self.conn.prepare(sql).map_err(to_py_err)?;
-        let column_names: Vec<String> = (0..stmt.column_count())
-            .filter_map(|i| stmt.column_name(i).map(String::from))
-            .collect();
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+
+        // Release GIL during SQLite work - fetch all rows upfront
+        let (column_names, rows) = py.allow_threads(move || {
+            let mut stmt = conn.query(&sql, params)?;
+
+            // Get column names
+            let column_names: Vec<String> = (0..stmt.column_count())
+                .filter_map(|i| stmt.column_name(i).map(String::from))
+                .collect();
+
+            // Fetch all rows
+            let mut rows = Vec::new();
+            while stmt.step()? {
+                let row: Vec<RustValue> = (0..stmt.column_count())
+                    .map(|i| stmt.column_value(i))
+                    .collect();
+                rows.push(row);
+            }
+
+            Ok::<_, RustError>((column_names, rows))
+        }).map_err(to_py_err)?;
 
         Ok(PyCursor {
-            conn: self.conn.clone(),
-            sql: sql.to_string(),
-            params,
+            rows,
+            position: 0,
             column_names,
-            executed: false,
         })
     }
 
@@ -339,56 +391,45 @@ impl PyConnection {
 }
 
 /// A database cursor for iterating over query results
-/// No Mutex needed - SQLite handles synchronization internally (THREADSAFE=1)
+/// Pre-fetches all rows for efficiency - no re-execution on each fetch
 #[pyclass(name = "Cursor")]
 pub struct PyCursor {
-    conn: Arc<RustConnection>,
-    sql: String,
-    params: Vec<RustValue>,
+    rows: Vec<Vec<RustValue>>,  // Pre-fetched rows
+    position: usize,            // Current position for iteration
     column_names: Vec<String>,
-    executed: bool,
 }
 
 #[pymethods]
 impl PyCursor {
-    /// Execute the query
-    fn execute(&mut self) -> PyResult<()> {
-        self.executed = true;
-        Ok(())
-    }
-
     /// Fetch all remaining rows
     fn fetchall<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyList>> {
-        if !self.executed {
-            self.execute()?;
-        }
+        // Take remaining rows from current position
+        let remaining: Vec<PyObject> = self.rows[self.position..]
+            .iter()
+            .map(|row| {
+                let values: Vec<PyObject> = row.iter()
+                    .map(|v| value_to_py(py, v.clone()))
+                    .collect();
+                PyTuple::new_bound(py, &values).into_any().unbind()
+            })
+            .collect();
 
-        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        // Move position to end
+        self.position = self.rows.len();
 
-        let mut rows = Vec::new();
-        while stmt.step().map_err(to_py_err)? {
-            let row_values: Vec<PyObject> = (0..stmt.column_count())
-                .map(|i| value_to_py(py, stmt.column_value(i)))
-                .collect();
-            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
-        }
-
-        Ok(PyList::new_bound(py, &rows).unbind())
+        Ok(PyList::new_bound(py, &remaining).unbind())
     }
 
     /// Fetch the next row
     fn fetchone<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Py<PyTuple>>> {
-        if !self.executed {
-            self.execute()?;
-        }
+        if self.position < self.rows.len() {
+            let row = &self.rows[self.position];
+            self.position += 1;
 
-        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
-
-        if stmt.step().map_err(to_py_err)? {
-            let row_values: Vec<PyObject> = (0..stmt.column_count())
-                .map(|i| value_to_py(py, stmt.column_value(i)))
+            let values: Vec<PyObject> = row.iter()
+                .map(|v| value_to_py(py, v.clone()))
                 .collect();
-            Ok(Some(PyTuple::new_bound(py, &row_values).unbind()))
+            Ok(Some(PyTuple::new_bound(py, &values).unbind()))
         } else {
             Ok(None)
         }
@@ -398,24 +439,21 @@ impl PyCursor {
     #[pyo3(signature = (size=None))]
     fn fetchmany<'py>(&mut self, py: Python<'py>, size: Option<usize>) -> PyResult<Py<PyList>> {
         let size = size.unwrap_or(100);
+        let end = std::cmp::min(self.position + size, self.rows.len());
 
-        if !self.executed {
-            self.execute()?;
-        }
+        let batch: Vec<PyObject> = self.rows[self.position..end]
+            .iter()
+            .map(|row| {
+                let values: Vec<PyObject> = row.iter()
+                    .map(|v| value_to_py(py, v.clone()))
+                    .collect();
+                PyTuple::new_bound(py, &values).into_any().unbind()
+            })
+            .collect();
 
-        let mut stmt = self.conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        self.position = end;
 
-        let mut rows = Vec::new();
-        let mut count = 0;
-        while count < size && stmt.step().map_err(to_py_err)? {
-            let row_values: Vec<PyObject> = (0..stmt.column_count())
-                .map(|i| value_to_py(py, stmt.column_value(i)))
-                .collect();
-            rows.push(PyTuple::new_bound(py, &row_values).into_any().unbind());
-            count += 1;
-        }
-
-        Ok(PyList::new_bound(py, &rows).unbind())
+        Ok(PyList::new_bound(py, &batch).unbind())
     }
 
     /// Get column names
@@ -443,8 +481,28 @@ impl PyCursor {
         Ok(PyList::new_bound(py, &desc).unbind())
     }
 
+    /// Get row count (number of rows fetched)
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rows.len() as i64
+    }
+
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> Option<Py<PyTuple>> {
+        if self.position < self.rows.len() {
+            let row = &self.rows[self.position];
+            self.position += 1;
+
+            let values: Vec<PyObject> = row.iter()
+                .map(|v| value_to_py(py, v.clone()))
+                .collect();
+            Some(PyTuple::new_bound(py, &values).unbind())
+        } else {
+            None
+        }
     }
 }
 
