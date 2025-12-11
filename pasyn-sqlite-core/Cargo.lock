@@ -143,6 +143,7 @@ name = "pasyn-sqlite-core"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libc",
  "once_cell",
  "parking_lot",
  "pkg-config",

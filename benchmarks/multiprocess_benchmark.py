@@ -639,7 +639,7 @@ def run_single_implementation(
 
 def run_all_benchmarks(config: BenchmarkConfig) -> dict[str, ImplementationResult]:
     """Run benchmarks for all implementations."""
-    implementations = ["main_thread", "single_thread", "multiplexed"]
+    implementations = ["main_thread", "multiplexed"]
     results: dict[str, ImplementationResult] = {}
 
     print(f"\n{'#' * 80}")
@@ -688,37 +688,36 @@ def print_comparison_table(results: dict[str, ImplementationResult]) -> None:
     print(f"{'#' * 80}\n")
 
     # Header
-    print(f"{'Metric':<30} {'main_thread':>15} {'single_thread':>15} {'multiplexed':>15}")
-    print("-" * 80)
+    print(f"{'Metric':<30} {'main_thread':>15} {'multiplexed':>15}")
+    print("-" * 65)
 
     # Get results
     mt = results.get("main_thread")
-    st = results.get("single_thread")
     mx = results.get("multiplexed")
 
-    if not all([mt, st, mx]):
+    if not all([mt, mx]):
         print("Missing results for some implementations")
         return
 
     # Throughput
-    print(f"{'Total Time (s)':<30} {mt.total_elapsed_s:>15.2f} {st.total_elapsed_s:>15.2f} {mx.total_elapsed_s:>15.2f}")
-    print(f"{'Total Operations':<30} {mt.total_operations:>15} {st.total_operations:>15} {mx.total_operations:>15}")
-    print(f"{'Throughput (ops/s)':<30} {mt.throughput_ops_per_s:>15.1f} {st.throughput_ops_per_s:>15.1f} {mx.throughput_ops_per_s:>15.1f}")
-    print(f"{'Read Throughput (ops/s)':<30} {mt.read_throughput:>15.1f} {st.read_throughput:>15.1f} {mx.read_throughput:>15.1f}")
-    print(f"{'Write Throughput (ops/s)':<30} {mt.write_throughput:>15.1f} {st.write_throughput:>15.1f} {mx.write_throughput:>15.1f}")
+    print(f"{'Total Time (s)':<30} {mt.total_elapsed_s:>15.2f} {mx.total_elapsed_s:>15.2f}")
+    print(f"{'Total Operations':<30} {mt.total_operations:>15} {mx.total_operations:>15}")
+    print(f"{'Throughput (ops/s)':<30} {mt.throughput_ops_per_s:>15.1f} {mx.throughput_ops_per_s:>15.1f}")
+    print(f"{'Read Throughput (ops/s)':<30} {mt.read_throughput:>15.1f} {mx.read_throughput:>15.1f}")
+    print(f"{'Write Throughput (ops/s)':<30} {mt.write_throughput:>15.1f} {mx.write_throughput:>15.1f}")
 
     print()
-    print(f"{'Read Latency Mean (ms)':<30} {mt.read_latency_mean_ms:>15.3f} {st.read_latency_mean_ms:>15.3f} {mx.read_latency_mean_ms:>15.3f}")
-    print(f"{'Read Latency Median (ms)':<30} {mt.read_latency_median_ms:>15.3f} {st.read_latency_median_ms:>15.3f} {mx.read_latency_median_ms:>15.3f}")
-    print(f"{'Read Latency P95 (ms)':<30} {mt.read_latency_p95_ms:>15.3f} {st.read_latency_p95_ms:>15.3f} {mx.read_latency_p95_ms:>15.3f}")
+    print(f"{'Read Latency Mean (ms)':<30} {mt.read_latency_mean_ms:>15.3f} {mx.read_latency_mean_ms:>15.3f}")
+    print(f"{'Read Latency Median (ms)':<30} {mt.read_latency_median_ms:>15.3f} {mx.read_latency_median_ms:>15.3f}")
+    print(f"{'Read Latency P95 (ms)':<30} {mt.read_latency_p95_ms:>15.3f} {mx.read_latency_p95_ms:>15.3f}")
 
     print()
-    print(f"{'Write Latency Mean (ms)':<30} {mt.write_latency_mean_ms:>15.3f} {st.write_latency_mean_ms:>15.3f} {mx.write_latency_mean_ms:>15.3f}")
-    print(f"{'Write Latency Median (ms)':<30} {mt.write_latency_median_ms:>15.3f} {st.write_latency_median_ms:>15.3f} {mx.write_latency_median_ms:>15.3f}")
-    print(f"{'Write Latency P95 (ms)':<30} {mt.write_latency_p95_ms:>15.3f} {st.write_latency_p95_ms:>15.3f} {mx.write_latency_p95_ms:>15.3f}")
+    print(f"{'Write Latency Mean (ms)':<30} {mt.write_latency_mean_ms:>15.3f} {mx.write_latency_mean_ms:>15.3f}")
+    print(f"{'Write Latency Median (ms)':<30} {mt.write_latency_median_ms:>15.3f} {mx.write_latency_median_ms:>15.3f}")
+    print(f"{'Write Latency P95 (ms)':<30} {mt.write_latency_p95_ms:>15.3f} {mx.write_latency_p95_ms:>15.3f}")
 
     print()
-    print(f"{'Errors':<30} {mt.errors:>15} {st.errors:>15} {mx.errors:>15}")
+    print(f"{'Errors':<30} {mt.errors:>15} {mx.errors:>15}")
 
     # Relative performance
     print(f"\n{'=' * 80}")
