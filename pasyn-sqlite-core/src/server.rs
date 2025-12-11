@@ -4,6 +4,25 @@
 //! - Listens on a Unix socket for write requests
 //! - Maintains a single SQLite connection for writes
 //! - Serializes all write operations
+//! - **Batches concurrent writes** using savepoints for efficiency
+//!
+//! ## Write Batching
+//!
+//! When multiple write requests arrive concurrently, the server batches them
+//! into a single transaction with SAVEPOINTs for isolation:
+//!
+//! ```text
+//! BEGIN
+//!   SAVEPOINT sp0; INSERT ...; RELEASE sp0;  -- Request 1
+//!   SAVEPOINT sp1; INSERT ...; RELEASE sp1;  -- Request 2
+//!   SAVEPOINT sp2; INSERT ...; RELEASE sp2;  -- Request 3
+//! COMMIT  -- Single disk sync for all requests!
+//! ```
+//!
+//! This provides:
+//! - **Low latency**: First request processed immediately
+//! - **High throughput**: Concurrent requests batched (fewer disk syncs)
+//! - **Failure isolation**: Each request isolated via SAVEPOINT
 //!
 //! Usage:
 //! ```no_run
@@ -36,6 +55,10 @@ pub struct ServerConfig {
     pub busy_timeout_ms: i32,
     /// Enable WAL mode (default: true)
     pub wal_mode: bool,
+    /// Maximum batch size for write batching (default: 100)
+    pub max_batch_size: usize,
+    /// Enable write batching with savepoints (default: true)
+    pub enable_batching: bool,
 }
 
 impl ServerConfig {
@@ -46,6 +69,8 @@ impl ServerConfig {
             socket_path: socket_path.as_ref().to_path_buf(),
             busy_timeout_ms: 5000,
             wal_mode: true,
+            max_batch_size: 100,
+            enable_batching: true,
         }
     }
 
@@ -58,6 +83,18 @@ impl ServerConfig {
     /// Set whether to enable WAL mode
     pub fn wal_mode(mut self, enable: bool) -> Self {
         self.wal_mode = enable;
+        self
+    }
+
+    /// Set maximum batch size for write batching
+    pub fn max_batch_size(mut self, size: usize) -> Self {
+        self.max_batch_size = size;
+        self
+    }
+
+    /// Enable or disable write batching
+    pub fn enable_batching(mut self, enable: bool) -> Self {
+        self.enable_batching = enable;
         self
     }
 
@@ -195,13 +232,14 @@ impl WriterServer {
         Ok(())
     }
 
-    /// Handle a single client connection
+    /// Handle a single client connection with write batching
     fn handle_connection(&self, conn: &Connection, stream: UnixStream) -> io::Result<()> {
+        let raw_stream = stream.try_clone()?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = BufWriter::new(stream);
 
         loop {
-            // Read request
+            // Read first request (blocking)
             let data = match read_message(&mut reader) {
                 Ok(data) => data,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -211,26 +249,187 @@ impl WriterServer {
                 Err(e) => return Err(e),
             };
 
-            let request = Request::deserialize(&data)?;
+            let first_request = Request::deserialize(&data)?;
 
-            // Handle shutdown request
-            if request.request_type == RequestType::Shutdown {
-                let response = Response::simple_ok().with_id(request.request_id);
+            // Handle shutdown request immediately
+            if first_request.request_type == RequestType::Shutdown {
+                let response = Response::simple_ok().with_id(first_request.request_id);
                 write_message(&mut writer, &response.serialize())?;
                 self.shutdown();
                 break;
             }
 
-            // Process request and echo back request_id
-            let response = self
-                .process_request(conn, &request)
-                .with_id(request.request_id);
+            // Collect additional pending requests (non-blocking)
+            let mut requests = vec![first_request];
+            if self.config.enable_batching {
+                self.collect_pending_requests(&raw_stream, &mut reader, &mut requests)?;
+            }
 
-            // Send response
-            write_message(&mut writer, &response.serialize())?;
+            // Process requests (batched if possible)
+            let responses = self.process_batch(conn, &requests);
+
+            // Send all responses
+            for response in responses {
+                write_message(&mut writer, &response.serialize())?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Collect any pending requests from the socket (non-blocking)
+    fn collect_pending_requests(
+        &self,
+        raw_stream: &UnixStream,
+        reader: &mut BufReader<UnixStream>,
+        requests: &mut Vec<Request>,
+    ) -> io::Result<()> {
+        // Set non-blocking to check for pending data
+        raw_stream.set_nonblocking(true)?;
+
+        while requests.len() < self.config.max_batch_size {
+            match read_message(reader) {
+                Ok(data) => {
+                    if let Ok(request) = Request::deserialize(&data) {
+                        // Stop collecting on shutdown request
+                        if request.request_type == RequestType::Shutdown {
+                            requests.push(request);
+                            break;
+                        }
+                        requests.push(request);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No more pending data
+                    break;
+                }
+                Err(_) => {
+                    // Other error, stop collecting
+                    break;
+                }
+            }
+        }
+
+        // Restore blocking mode
+        raw_stream.set_nonblocking(false)?;
+        Ok(())
+    }
+
+    /// Check if a request type can be batched with savepoints
+    fn is_batchable(request_type: RequestType) -> bool {
+        matches!(
+            request_type,
+            RequestType::Execute | RequestType::ExecuteReturningRowId
+        )
+    }
+
+    /// Process a batch of requests, using savepoints when beneficial
+    fn process_batch(&self, conn: &Connection, requests: &[Request]) -> Vec<Response> {
+        // If only one request or batching disabled, process normally
+        if requests.len() == 1 || !self.config.enable_batching {
+            return requests
+                .iter()
+                .map(|req| self.process_request(conn, req).with_id(req.request_id))
+                .collect();
+        }
+
+        // Check if all requests are batchable and we're in autocommit mode
+        let all_batchable = requests.iter().all(|r| Self::is_batchable(r.request_type));
+
+        if all_batchable && conn.is_autocommit() {
+            // Batch with savepoints
+            self.process_batch_with_savepoints(conn, requests)
+        } else {
+            // Mixed batch - process individually
+            requests
+                .iter()
+                .map(|req| self.process_request(conn, req).with_id(req.request_id))
+                .collect()
+        }
+    }
+
+    /// Process multiple requests in a single transaction with savepoints
+    fn process_batch_with_savepoints(&self, conn: &Connection, requests: &[Request]) -> Vec<Response> {
+        let mut responses = Vec::with_capacity(requests.len());
+
+        // Begin batch transaction
+        if let Err(e) = conn.execute_batch("BEGIN") {
+            // Failed to begin - process all as errors
+            return requests
+                .iter()
+                .map(|req| Response::error(format!("Batch begin failed: {}", e)).with_id(req.request_id))
+                .collect();
+        }
+
+        // Process each request with a savepoint
+        for (i, request) in requests.iter().enumerate() {
+            let sp_name = format!("sp{}", i);
+
+            // Create savepoint
+            if let Err(e) = conn.execute_batch(&format!("SAVEPOINT {}", sp_name)) {
+                responses.push(
+                    Response::error(format!("Savepoint failed: {}", e)).with_id(request.request_id),
+                );
+                continue;
+            }
+
+            // Process the request
+            let response = self.process_single_in_savepoint(conn, request, &sp_name);
+            responses.push(response.with_id(request.request_id));
+        }
+
+        // Commit the batch transaction
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            // Commit failed - try to rollback
+            let _ = conn.execute_batch("ROLLBACK");
+            // Mark all successful responses as failed
+            for response in &mut responses {
+                if response.is_ok() {
+                    *response = Response::error(format!("Batch commit failed: {}", e))
+                        .with_id(response.request_id);
+                }
+            }
+        }
+
+        responses
+    }
+
+    /// Process a single request within a savepoint
+    fn process_single_in_savepoint(
+        &self,
+        conn: &Connection,
+        request: &Request,
+        sp_name: &str,
+    ) -> Response {
+        let response = match request.request_type {
+            RequestType::Execute | RequestType::ExecuteReturningRowId => {
+                if let Some(ref sql) = request.sql {
+                    match conn.execute(sql, request.params.clone()) {
+                        Ok(rows) => {
+                            // Release savepoint on success
+                            let _ = conn.execute_batch(&format!("RELEASE {}", sp_name));
+                            Response::ok(rows as i64, conn.last_insert_rowid())
+                        }
+                        Err(e) => {
+                            // Rollback savepoint on error
+                            let _ = conn.execute_batch(&format!("ROLLBACK TO {}", sp_name));
+                            let _ = conn.execute_batch(&format!("RELEASE {}", sp_name));
+                            Response::error(e.to_string())
+                        }
+                    }
+                } else {
+                    let _ = conn.execute_batch(&format!("RELEASE {}", sp_name));
+                    Response::error("Missing SQL statement")
+                }
+            }
+            _ => {
+                // Non-batchable request - shouldn't happen but handle gracefully
+                let _ = conn.execute_batch(&format!("RELEASE {}", sp_name));
+                self.process_request(conn, request)
+            }
+        };
+
+        response
     }
 
     /// Process a single request
