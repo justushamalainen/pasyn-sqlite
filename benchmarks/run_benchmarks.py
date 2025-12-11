@@ -365,15 +365,20 @@ class Benchmark:
     async def bench_batch_write(
         self, impl: BaseSQLiteImplementation, impl_name: str
     ) -> BenchmarkResult:
-        """Benchmark: Batch insert (100 rows at once)."""
+        """Benchmark: Batch insert (100 rows at once) within a transaction."""
         counter = [0]
 
         async def task() -> None:
             base = counter[0] * 100
             counter[0] += 1
             rows = [(f"BatchUser{base + i}", f"batch{base + i}@test.com", 30) for i in range(100)]
-            await impl.executemany("INSERT INTO users (name, email, age) VALUES (?, ?, ?)", rows)
-            await impl.commit()
+
+            async def batch_ops(db: BaseSQLiteImplementation) -> None:
+                await db.executemany(
+                    "INSERT INTO users (name, email, age) VALUES (?, ?, ?)", rows
+                )
+
+            await impl.run_in_transaction(batch_ops)
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("batch_write", impl_name, times)

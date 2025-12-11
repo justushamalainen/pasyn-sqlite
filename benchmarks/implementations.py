@@ -81,7 +81,8 @@ class MainThreadSQLite(BaseSQLiteImplementation):
         self._conn: sqlite3.Connection | None = None
 
     async def setup(self, db_path: str) -> None:
-        self._conn = sqlite3.connect(db_path)
+        # Use isolation_level=None for autocommit mode - each statement is its own transaction
+        self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
@@ -138,7 +139,9 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         await self._submit(lambda conn: None)
 
     def _worker_loop(self) -> None:
-        self._conn = sqlite3.connect(self._db_path)
+        # Use isolation_level=None for autocommit mode - each statement is its own transaction
+        # This prevents implicit batching when multiple concurrent tasks submit writes
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
