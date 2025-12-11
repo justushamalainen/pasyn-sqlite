@@ -298,8 +298,12 @@ extern "C" {
     ) -> c_int;
     pub fn sqlite3_blob_close(blob: *mut sqlite3_blob) -> c_int;
     pub fn sqlite3_blob_bytes(blob: *mut sqlite3_blob) -> c_int;
-    pub fn sqlite3_blob_read(blob: *mut sqlite3_blob, Z: *mut c_void, N: c_int, iOffset: c_int)
-        -> c_int;
+    pub fn sqlite3_blob_read(
+        blob: *mut sqlite3_blob,
+        Z: *mut c_void,
+        N: c_int,
+        iOffset: c_int,
+    ) -> c_int;
     pub fn sqlite3_blob_write(
         blob: *mut sqlite3_blob,
         z: *const c_void,
@@ -368,7 +372,10 @@ mod tests {
     fn test_sqlite_version() {
         unsafe {
             let version = sqlite3_libversion_number();
-            assert!(version >= 3000000, "SQLite version should be at least 3.0.0");
+            assert!(
+                version >= 3000000,
+                "SQLite version should be at least 3.0.0"
+            );
         }
     }
 

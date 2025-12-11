@@ -105,7 +105,8 @@ impl Connection {
         let c_path = CString::new(path_str.as_bytes())?;
 
         let mut db: *mut ffi::sqlite3 = ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags.bits(), ptr::null()) };
+        let rc =
+            unsafe { ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags.bits(), ptr::null()) };
 
         if rc != ffi::SQLITE_OK {
             // Even on error, we might get a db handle that needs to be closed
@@ -199,13 +200,7 @@ impl Connection {
         let mut errmsg: *mut std::os::raw::c_char = ptr::null_mut();
 
         let rc = unsafe {
-            ffi::sqlite3_exec(
-                self.db,
-                c_sql.as_ptr(),
-                None,
-                ptr::null_mut(),
-                &mut errmsg,
-            )
+            ffi::sqlite3_exec(self.db, c_sql.as_ptr(), None, ptr::null_mut(), &mut errmsg)
         };
 
         if rc != ffi::SQLITE_OK {
@@ -283,19 +278,28 @@ impl Connection {
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         self.execute_batch("BEGIN")?;
-        Ok(Transaction { conn: self, committed: false })
+        Ok(Transaction {
+            conn: self,
+            committed: false,
+        })
     }
 
     /// Begin an immediate transaction
     pub fn begin_immediate(&self) -> Result<Transaction> {
         self.execute_batch("BEGIN IMMEDIATE")?;
-        Ok(Transaction { conn: self, committed: false })
+        Ok(Transaction {
+            conn: self,
+            committed: false,
+        })
     }
 
     /// Begin an exclusive transaction
     pub fn begin_exclusive(&self) -> Result<Transaction> {
         self.execute_batch("BEGIN EXCLUSIVE")?;
-        Ok(Transaction { conn: self, committed: false })
+        Ok(Transaction {
+            conn: self,
+            committed: false,
+        })
     }
 
     /// Check if the connection is in autocommit mode
@@ -539,9 +543,14 @@ mod tests {
     #[test]
     fn test_execute() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)", NO_PARAMS)
+        conn.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)",
+            NO_PARAMS,
+        )
+        .unwrap();
+        let changes = conn
+            .execute("INSERT INTO test (name) VALUES (?1)", ["Alice"])
             .unwrap();
-        let changes = conn.execute("INSERT INTO test (name) VALUES (?1)", ["Alice"]).unwrap();
         assert_eq!(changes, 1);
         assert_eq!(conn.last_insert_rowid(), 1);
     }
@@ -549,13 +558,13 @@ mod tests {
     #[test]
     fn test_query() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER, name TEXT)", NO_PARAMS).unwrap();
-        conn.execute("INSERT INTO test VALUES (1, 'Alice')", NO_PARAMS).unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER, name TEXT)", NO_PARAMS)
+            .unwrap();
+        conn.execute("INSERT INTO test VALUES (1, 'Alice')", NO_PARAMS)
+            .unwrap();
 
         let name: Option<String> = conn
-            .query_row("SELECT name FROM test WHERE id = ?1", [1], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT name FROM test WHERE id = ?1", [1], |row| row.get(0))
             .unwrap();
         assert_eq!(name, Some("Alice".to_string()));
     }
@@ -563,19 +572,24 @@ mod tests {
     #[test]
     fn test_transaction() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER)", NO_PARAMS).unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER)", NO_PARAMS)
+            .unwrap();
 
         // Test commit
         {
             let tx = conn.begin_transaction().unwrap();
-            tx.connection().execute("INSERT INTO test VALUES (1)", NO_PARAMS).unwrap();
+            tx.connection()
+                .execute("INSERT INTO test VALUES (1)", NO_PARAMS)
+                .unwrap();
             tx.commit().unwrap();
         }
 
         // Test rollback
         {
             let tx = conn.begin_transaction().unwrap();
-            tx.connection().execute("INSERT INTO test VALUES (2)", NO_PARAMS).unwrap();
+            tx.connection()
+                .execute("INSERT INTO test VALUES (2)", NO_PARAMS)
+                .unwrap();
             tx.rollback().unwrap();
         }
 

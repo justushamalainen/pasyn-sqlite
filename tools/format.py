@@ -4,7 +4,7 @@
 import argparse
 import sys
 
-from common import ROOT_DIR, RUST_CORE_DIR, print_error, print_header, print_success, run
+from common import RUST_CORE_DIR, print_error, print_header, print_success, run
 
 
 def format_python() -> bool:
@@ -43,12 +43,8 @@ def format_rust() -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Format pasyn-sqlite code")
-    parser.add_argument(
-        "--python", action="store_true", help="Format Python code only"
-    )
-    parser.add_argument(
-        "--rust", action="store_true", help="Format Rust code only"
-    )
+    parser.add_argument("--python", action="store_true", help="Format Python code only")
+    parser.add_argument("--rust", action="store_true", help="Format Rust code only")
     args = parser.parse_args()
 
     # Default to formatting both if neither specified

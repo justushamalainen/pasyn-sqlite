@@ -130,17 +130,27 @@ impl WriterServer {
 
         // Open the SQLite connection
         let conn = Connection::open(&self.config.database_path).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Failed to open database: {}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to open database: {}", e),
+            )
         })?;
 
         // Configure the connection
-        conn.busy_timeout(self.config.busy_timeout_ms).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Failed to set busy timeout: {}", e))
-        })?;
+        conn.busy_timeout(self.config.busy_timeout_ms)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to set busy timeout: {}", e),
+                )
+            })?;
 
         if self.config.wal_mode {
             conn.execute_batch("PRAGMA journal_mode=WAL").map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Failed to enable WAL mode: {}", e))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to enable WAL mode: {}", e),
+                )
             })?;
         }
 
@@ -212,7 +222,9 @@ impl WriterServer {
             }
 
             // Process request and echo back request_id
-            let response = self.process_request(conn, &request).with_id(request.request_id);
+            let response = self
+                .process_request(conn, &request)
+                .with_id(request.request_id);
 
             // Send response
             write_message(&mut writer, &response.serialize())?;
@@ -380,7 +392,10 @@ mod tests {
     #[test]
     fn test_default_socket_path() {
         let socket_path = ServerConfig::default_socket_path("/path/to/mydb.sqlite");
-        assert_eq!(socket_path, PathBuf::from("/path/to/.mydb.sqlite.writer.sock"));
+        assert_eq!(
+            socket_path,
+            PathBuf::from("/path/to/.mydb.sqlite.writer.sock")
+        );
     }
 
     #[test]

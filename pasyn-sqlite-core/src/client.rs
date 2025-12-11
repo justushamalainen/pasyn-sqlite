@@ -75,7 +75,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -94,7 +96,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -109,7 +113,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -126,7 +132,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -141,7 +149,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -156,7 +166,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -171,7 +183,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -186,7 +200,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -201,7 +217,9 @@ impl MultiplexedClient {
         } else {
             Err(Error::with_message(
                 ErrorCode::Error,
-                response.error_message.unwrap_or_else(|| "Unknown error".to_string()),
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
             ))
         }
     }
@@ -220,9 +238,9 @@ impl MultiplexedClient {
         let (response_tx, response_rx) = channel();
 
         // 1. Submit to channel (lock-free, never blocks)
-        self.sender.send((id, request, response_tx)).map_err(|_| {
-            Error::with_message(ErrorCode::IoError, "Channel closed")
-        })?;
+        self.sender
+            .send((id, request, response_tx))
+            .map_err(|_| Error::with_message(ErrorCode::IoError, "Channel closed"))?;
 
         // 2. Try to become the I/O handler
         if let Ok(mut io) = self.io.try_lock() {
@@ -231,9 +249,9 @@ impl MultiplexedClient {
         // If try_lock fails, another thread is handling I/O - they'll process our request
 
         // 3. Wait for our response
-        response_rx.recv().map_err(|_| {
-            Error::with_message(ErrorCode::IoError, "Response channel closed")
-        })
+        response_rx
+            .recv()
+            .map_err(|_| Error::with_message(ErrorCode::IoError, "Response channel closed"))
     }
 
     /// Process all pending I/O. Called while holding the io lock.

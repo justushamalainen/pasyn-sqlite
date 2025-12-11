@@ -496,7 +496,9 @@ impl Response {
         if self.is_ok() {
             Ok((self.rows_affected, self.last_insert_rowid))
         } else {
-            Err(self.error_message.unwrap_or_else(|| "Unknown error".to_string()))
+            Err(self
+                .error_message
+                .unwrap_or_else(|| "Unknown error".to_string()))
         }
     }
 }
@@ -629,7 +631,10 @@ mod tests {
         let deserialized = Request::deserialize(&serialized).unwrap();
 
         assert_eq!(deserialized.request_type, RequestType::Execute);
-        assert_eq!(deserialized.sql, Some("INSERT INTO test VALUES (?, ?, ?)".to_string()));
+        assert_eq!(
+            deserialized.sql,
+            Some("INSERT INTO test VALUES (?, ?, ?)".to_string())
+        );
         assert_eq!(deserialized.params.len(), 3);
         assert_eq!(deserialized.params[0], Value::Integer(42));
         assert_eq!(deserialized.params[1], Value::Text("hello".to_string()));
@@ -654,6 +659,9 @@ mod tests {
         let deserialized = Response::deserialize(&serialized).unwrap();
 
         assert!(!deserialized.is_ok());
-        assert_eq!(deserialized.error_message, Some("Something went wrong".to_string()));
+        assert_eq!(
+            deserialized.error_message,
+            Some("Something went wrong".to_string())
+        );
     }
 }

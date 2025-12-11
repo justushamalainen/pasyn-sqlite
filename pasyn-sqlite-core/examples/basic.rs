@@ -87,8 +87,10 @@ fn main() -> Result<()> {
     println!("Transaction example:");
     {
         let tx = conn.begin_transaction()?;
-        tx.connection()
-            .execute("INSERT INTO users (name, age) VALUES (?1, ?2)", ["Dave", "40"])?;
+        tx.connection().execute(
+            "INSERT INTO users (name, age) VALUES (?1, ?2)",
+            ["Dave", "40"],
+        )?;
         println!("  Inserted Dave (not committed yet)");
 
         // Commit the transaction
@@ -97,12 +99,16 @@ fn main() -> Result<()> {
     }
 
     // Count users
-    let count: Option<i64> = conn.query_row("SELECT COUNT(*) FROM users", NO_PARAMS, |row| row.get(0))?;
+    let count: Option<i64> =
+        conn.query_row("SELECT COUNT(*) FROM users", NO_PARAMS, |row| row.get(0))?;
     println!("Total users: {}", count.unwrap_or(0));
 
     // Memory stats
     println!();
-    println!("SQLite memory used: {} bytes", pasyn_sqlite_core::memory_used());
+    println!(
+        "SQLite memory used: {} bytes",
+        pasyn_sqlite_core::memory_used()
+    );
     println!(
         "SQLite memory highwater: {} bytes",
         pasyn_sqlite_core::memory_highwater(false)

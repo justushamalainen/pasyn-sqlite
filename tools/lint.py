@@ -4,7 +4,7 @@
 import argparse
 import sys
 
-from common import ROOT_DIR, RUST_CORE_DIR, print_error, print_header, print_success, run
+from common import RUST_CORE_DIR, print_error, print_header, print_success, run
 
 
 def lint_python() -> bool:
@@ -53,12 +53,8 @@ def lint_rust() -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run pasyn-sqlite linters")
-    parser.add_argument(
-        "--python", action="store_true", help="Run Python linters only"
-    )
-    parser.add_argument(
-        "--rust", action="store_true", help="Run Rust linters only"
-    )
+    parser.add_argument("--python", action="store_true", help="Run Python linters only")
+    parser.add_argument("--rust", action="store_true", help="Run Rust linters only")
     args = parser.parse_args()
 
     # Default to running both if neither specified

@@ -4,7 +4,7 @@
 import argparse
 import sys
 
-from common import ROOT_DIR, RUST_CORE_DIR, print_error, print_header, print_success, run
+from common import RUST_CORE_DIR, print_error, print_header, print_success, run
 
 
 def test_python(verbose: bool = False) -> bool:
@@ -36,15 +36,9 @@ def test_rust() -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run pasyn-sqlite tests")
-    parser.add_argument(
-        "--python", action="store_true", help="Run Python tests only"
-    )
-    parser.add_argument(
-        "--rust", action="store_true", help="Run Rust tests only"
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Verbose output"
-    )
+    parser.add_argument("--python", action="store_true", help="Run Python tests only")
+    parser.add_argument("--rust", action="store_true", help="Run Rust tests only")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
     # Default to running both if neither specified

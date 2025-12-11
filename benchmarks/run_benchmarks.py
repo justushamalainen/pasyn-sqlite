@@ -24,15 +24,16 @@ import asyncio
 import statistics
 import tempfile
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Coroutine, Any
+from typing import Any, Callable
 
 from implementations import (
     BaseSQLiteImplementation,
     MainThreadSQLite,
-    SingleThreadSQLite,
     MultiplexedSQLite,
+    SingleThreadSQLite,
 )
 
 
@@ -52,9 +53,7 @@ class BenchmarkResult:
     times_ms: list[float] = field(default_factory=list, repr=False)
 
     @classmethod
-    def from_times(
-        cls, name: str, implementation: str, times_ms: list[float]
-    ) -> "BenchmarkResult":
+    def from_times(cls, name: str, implementation: str, times_ms: list[float]) -> BenchmarkResult:
         return cls(
             name=name,
             implementation=implementation,
@@ -161,9 +160,7 @@ class Benchmark:
         """Populate tables with test data."""
         # Insert users
         users = [(f"User {i}", f"user{i}@example.com", 20 + (i % 50)) for i in range(1000)]
-        await impl.executemany(
-            "INSERT INTO users (name, email, age) VALUES (?, ?, ?)", users
-        )
+        await impl.executemany("INSERT INTO users (name, email, age) VALUES (?, ?, ?)", users)
 
         # Insert products
         products = [
@@ -176,20 +173,14 @@ class Benchmark:
         )
 
         # Insert orders
-        orders = [
-            ((i % 1000) + 1, (i % 500) + 1, 1 + (i % 10))
-            for i in range(5000)
-        ]
+        orders = [((i % 1000) + 1, (i % 500) + 1, 1 + (i % 10)) for i in range(5000)]
         await impl.executemany(
             "INSERT INTO orders (user_id, product_id, quantity) VALUES (?, ?, ?)",
             orders,
         )
 
         # Insert documents with larger content
-        documents = [
-            (f"Document {i}", "x" * 1000, f'{{"key": "value{i}"}}')
-            for i in range(500)
-        ]
+        documents = [(f"Document {i}", "x" * 1000, f'{{"key": "value{i}"}}') for i in range(500)]
         await impl.executemany(
             "INSERT INTO documents (title, content, metadata) VALUES (?, ?, ?)",
             documents,
@@ -260,9 +251,7 @@ class Benchmark:
         """Benchmark: Read many rows with ORDER BY."""
 
         async def task() -> None:
-            await impl.execute(
-                "SELECT * FROM users WHERE age > ? ORDER BY name", (25,)
-            )
+            await impl.execute("SELECT * FROM users WHERE age > ? ORDER BY name", (25,))
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("large_read_ordered", impl_name, times)
@@ -285,13 +274,16 @@ class Benchmark:
         """Benchmark: Simple two-table join."""
 
         async def task() -> None:
-            await impl.execute("""
+            await impl.execute(
+                """
                 SELECT o.id, u.name, p.name, o.quantity
                 FROM orders o
                 JOIN users u ON o.user_id = u.id
                 JOIN products p ON o.product_id = p.id
                 WHERE o.id = ?
-            """, (100,))
+            """,
+                (100,),
+            )
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("join_small", impl_name, times)
@@ -302,14 +294,17 @@ class Benchmark:
         """Benchmark: Join returning many rows."""
 
         async def task() -> None:
-            await impl.execute("""
+            await impl.execute(
+                """
                 SELECT o.id, u.name, p.name, o.quantity
                 FROM orders o
                 JOIN users u ON o.user_id = u.id
                 JOIN products p ON o.product_id = p.id
                 WHERE u.age > ?
                 LIMIT 100
-            """, (40,))
+            """,
+                (40,),
+            )
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("join_large", impl_name, times)
@@ -376,35 +371,24 @@ class Benchmark:
         async def task() -> None:
             base = counter[0] * 100
             counter[0] += 1
-            rows = [
-                (f"BatchUser{base + i}", f"batch{base + i}@test.com", 30)
-                for i in range(100)
-            ]
-            await impl.executemany(
-                "INSERT INTO users (name, email, age) VALUES (?, ?, ?)", rows
-            )
+            rows = [(f"BatchUser{base + i}", f"batch{base + i}@test.com", 30) for i in range(100)]
+            await impl.executemany("INSERT INTO users (name, email, age) VALUES (?, ?, ?)", rows)
             await impl.commit()
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("batch_write", impl_name, times)
 
-    async def bench_update(
-        self, impl: BaseSQLiteImplementation, impl_name: str
-    ) -> BenchmarkResult:
+    async def bench_update(self, impl: BaseSQLiteImplementation, impl_name: str) -> BenchmarkResult:
         """Benchmark: Update single row."""
 
         async def task() -> None:
-            await impl.execute(
-                "UPDATE users SET age = age + 1 WHERE id = ?", (100,)
-            )
+            await impl.execute("UPDATE users SET age = age + 1 WHERE id = ?", (100,))
             await impl.commit()
 
         times = await self.run_timed(task)
         return BenchmarkResult.from_times("update", impl_name, times)
 
-    async def bench_delete(
-        self, impl: BaseSQLiteImplementation, impl_name: str
-    ) -> BenchmarkResult:
+    async def bench_delete(self, impl: BaseSQLiteImplementation, impl_name: str) -> BenchmarkResult:
         """Benchmark: Delete and reinsert (to maintain data)."""
 
         async def task() -> None:
@@ -562,14 +546,17 @@ class Benchmark:
 
         async def heavy_read_task(task_id: int) -> TaskResult:
             start = time.perf_counter()
-            await impl.execute("""
+            await impl.execute(
+                """
                 SELECT o.id, u.name, p.name, o.quantity
                 FROM orders o
                 JOIN users u ON o.user_id = u.id
                 JOIN products p ON o.product_id = p.id
                 WHERE u.age > ?
                 LIMIT 50
-            """, (20 + task_id % 30,))
+            """,
+                (20 + task_id % 30,),
+            )
             end = time.perf_counter()
             return TaskResult(
                 task_id=task_id,
@@ -730,9 +717,7 @@ class Benchmark:
                     (base_id + 1, f"ConcTx{base_id + 1}", f"conctx{base_id + 1}@test.com", 26),
                 )
                 await db.execute("SELECT * FROM users WHERE id >= ?", (base_id,))
-                await db.execute(
-                    "UPDATE users SET age = age + 1 WHERE id = ?", (base_id,)
-                )
+                await db.execute("UPDATE users SET age = age + 1 WHERE id = ?", (base_id,))
 
             await impl.run_in_transaction(ops)
             end = time.perf_counter()
@@ -784,9 +769,7 @@ class Benchmark:
                 await db.execute("SELECT * FROM users WHERE id = ?", (base_id,))
 
                 # Update based on read
-                await db.execute(
-                    "UPDATE users SET age = ? WHERE id = ?", (36, base_id)
-                )
+                await db.execute("UPDATE users SET age = ? WHERE id = ?", (36, base_id))
 
                 # Verify update
                 await db.execute("SELECT age FROM users WHERE id = ?", (base_id,))
@@ -849,9 +832,7 @@ def print_summary(all_results: dict[str, list[BenchmarkResult | WorkloadResult]]
 
     for bench_name, results in all_results.items():
         if isinstance(results[0], BenchmarkResult):
-            baseline = next(
-                (r for r in results if r.implementation == "main_thread"), None
-            )
+            baseline = next((r for r in results if r.implementation == "main_thread"), None)
             if baseline:
                 print(f"\n{bench_name}:")
                 for r in results:
@@ -860,9 +841,7 @@ def print_summary(all_results: dict[str, list[BenchmarkResult | WorkloadResult]]
                         faster = "faster" if speedup > 1 else "slower"
                         print(f"  {r.implementation:<20}: {speedup:.2f}x {faster}")
         else:
-            baseline = next(
-                (r for r in results if r.implementation == "main_thread"), None
-            )
+            baseline = next((r for r in results if r.implementation == "main_thread"), None)
             if baseline:
                 print(f"\n{bench_name}:")
                 for r in results:
@@ -913,7 +892,9 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
             print("Done.")
 
             # Run statement benchmarks
-            statement_benchmarks: list[tuple[str, Callable[..., Coroutine[Any, Any, BenchmarkResult]]]] = [
+            statement_benchmarks: list[
+                tuple[str, Callable[..., Coroutine[Any, Any, BenchmarkResult]]]
+            ] = [
                 ("small_read", bench.bench_small_read),
                 ("large_read", bench.bench_large_read),
                 ("large_read_ordered", bench.bench_large_read_ordered),
@@ -1003,10 +984,18 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
 
     # Statement benchmarks
     statement_names = [
-        "small_read", "large_read", "large_read_ordered", "huge_read",
-        "join_small", "join_large", "aggregate",
-        "small_write", "large_write", "batch_write",
-        "update", "delete_reinsert",
+        "small_read",
+        "large_read",
+        "large_read_ordered",
+        "huge_read",
+        "join_small",
+        "join_large",
+        "aggregate",
+        "small_write",
+        "large_write",
+        "batch_write",
+        "update",
+        "delete_reinsert",
     ]
     for name in statement_names:
         if name in all_results:
@@ -1014,7 +1003,9 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
 
     # Transaction benchmarks
     transaction_names = [
-        "transaction_simple", "transaction_batch", "transaction_with_reads",
+        "transaction_simple",
+        "transaction_batch",
+        "transaction_with_reads",
     ]
     for name in transaction_names:
         if name in all_results:
@@ -1022,9 +1013,12 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
 
     # Workload benchmarks
     workload_names = [
-        "concurrent_reads", "concurrent_writes",
-        "mixed_workload", "heavy_read_workload",
-        "db_with_io_simulation", "concurrent_transactions",
+        "concurrent_reads",
+        "concurrent_writes",
+        "mixed_workload",
+        "heavy_read_workload",
+        "db_with_io_simulation",
+        "concurrent_transactions",
     ]
     for name in workload_names:
         if name in all_results:

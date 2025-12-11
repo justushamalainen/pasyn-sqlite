@@ -152,9 +152,7 @@ impl Error {
             if ptr.is_null() {
                 "Unknown error".to_string()
             } else {
-                CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
 
@@ -174,9 +172,7 @@ impl Error {
             if ptr.is_null() {
                 "Unknown error".to_string()
             } else {
-                CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
 
