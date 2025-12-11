@@ -22,8 +22,8 @@ def run_benchmarks() -> bool:
 def run_multiprocess_benchmark(
     processes: int, operations: int, concurrent: int, read_ratio: float
 ) -> bool:
-    """Run the multiprocess benchmark."""
-    print_header("Running multiprocess benchmark")
+    """Run the multiprocess benchmark (compares all implementations)."""
+    print_header("Running multiprocess benchmark (all implementations)")
     try:
         cmd = [
             "python",
