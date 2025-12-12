@@ -47,17 +47,6 @@ fn py_to_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RustValue> {
     }
 }
 
-/// Convert a Rust Value to a Python object
-fn value_to_py(py: Python<'_>, value: RustValue) -> PyObject {
-    match value {
-        RustValue::Null => py.None(),
-        RustValue::Integer(i) => i.to_object(py),
-        RustValue::Real(f) => f.to_object(py),
-        RustValue::Text(s) => s.to_object(py),
-        RustValue::Blob(b) => PyBytes::new_bound(py, &b).into_any().unbind(),
-    }
-}
-
 /// Convert a SQLite statement column directly to Python object
 /// This bypasses the intermediate RustValue allocation for better performance
 #[inline]
