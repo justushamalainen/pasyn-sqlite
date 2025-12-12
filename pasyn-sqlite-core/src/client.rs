@@ -224,6 +224,140 @@ impl MultiplexedClient {
         }
     }
 
+    /// Acquire an exclusive transaction lock.
+    ///
+    /// This returns a Transaction guard that holds the lock. While the lock is held,
+    /// no other clients can perform write operations. The transaction must be
+    /// committed or rolled back within the server's timeout period (default: 1 second).
+    ///
+    /// The Transaction guard implements Drop, so if it goes out of scope without
+    /// being committed, it will automatically rollback.
+    pub fn begin_exclusive(&self) -> Result<Transaction> {
+        let request = Request::acquire_transaction_lock();
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            let token = response.transaction_token.ok_or_else(|| {
+                Error::with_message(ErrorCode::Error, "No transaction token received")
+            })?;
+            Ok(Transaction {
+                client: self,
+                token,
+                finished: false,
+            })
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Failed to acquire transaction lock".to_string()),
+            ))
+        }
+    }
+
+    /// Execute within a transaction (with token)
+    pub fn execute_with_token<P: IntoIterator>(
+        &self,
+        sql: &str,
+        params: P,
+        token: u64,
+    ) -> Result<usize>
+    where
+        P::Item: Into<Value>,
+    {
+        let params: Vec<Value> = params.into_iter().map(|p| p.into()).collect();
+        let request = Request::execute(sql, params).with_token(token);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(response.rows_affected as usize)
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
+    /// Execute returning rowid within a transaction (with token)
+    pub fn execute_returning_rowid_with_token<P: IntoIterator>(
+        &self,
+        sql: &str,
+        params: P,
+        token: u64,
+    ) -> Result<i64>
+    where
+        P::Item: Into<Value>,
+    {
+        let params: Vec<Value> = params.into_iter().map(|p| p.into()).collect();
+        let request = Request::execute_returning_rowid(sql, params).with_token(token);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(response.last_insert_rowid)
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
+    /// Execute batch within a transaction (with token)
+    pub fn execute_batch_with_token(&self, sql: &str, token: u64) -> Result<()> {
+        let request = Request::execute_batch(sql).with_token(token);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(())
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
+    /// Commit with token
+    pub fn commit_with_token(&self, token: u64) -> Result<()> {
+        let request = Request::commit().with_token(token);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(())
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
+    /// Rollback with token
+    pub fn rollback_with_token(&self, token: u64) -> Result<()> {
+        let request = Request::rollback().with_token(token);
+        let response = self.send_request(request)?;
+
+        if response.is_ok() {
+            Ok(())
+        } else {
+            Err(Error::with_message(
+                ErrorCode::Error,
+                response
+                    .error_message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            ))
+        }
+    }
+
     /// Send a request and wait for the response.
     ///
     /// This is the core multiplexing logic:
@@ -300,5 +434,87 @@ impl MultiplexedClient {
         }
 
         Ok(())
+    }
+}
+
+/// An exclusive transaction guard.
+///
+/// This struct represents an exclusive transaction lock. While this guard exists,
+/// no other clients can perform write operations on the database.
+///
+/// The transaction must be explicitly committed with `commit()`. If the guard
+/// is dropped without committing, the transaction will be automatically rolled back.
+///
+/// # Example
+///
+/// ```no_run
+/// use pasyn_sqlite_core::client::MultiplexedClient;
+/// use pasyn_sqlite_core::value::Value;
+///
+/// let client = MultiplexedClient::connect("/tmp/db.sock").unwrap();
+/// let tx = client.begin_exclusive().unwrap();
+///
+/// tx.execute("INSERT INTO users VALUES (?, ?)", [Value::Integer(1), Value::Text("Alice".to_string())]).unwrap();
+/// tx.execute("INSERT INTO users VALUES (?, ?)", [Value::Integer(2), Value::Text("Bob".to_string())]).unwrap();
+///
+/// tx.commit().unwrap();  // Commits the transaction and releases the lock
+/// ```
+pub struct Transaction<'a> {
+    client: &'a MultiplexedClient,
+    token: u64,
+    finished: bool,
+}
+
+impl<'a> Transaction<'a> {
+    /// Get the transaction token (for debugging/logging)
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Execute a SQL statement within this transaction.
+    pub fn execute<P: IntoIterator>(&self, sql: &str, params: P) -> Result<usize>
+    where
+        P::Item: Into<Value>,
+    {
+        self.client.execute_with_token(sql, params, self.token)
+    }
+
+    /// Execute a SQL statement and return the last insert rowid.
+    pub fn execute_returning_rowid<P: IntoIterator>(&self, sql: &str, params: P) -> Result<i64>
+    where
+        P::Item: Into<Value>,
+    {
+        self.client
+            .execute_returning_rowid_with_token(sql, params, self.token)
+    }
+
+    /// Execute multiple SQL statements (batch/script) within this transaction.
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.client.execute_batch_with_token(sql, self.token)
+    }
+
+    /// Commit the transaction and release the lock.
+    ///
+    /// After this call, the transaction guard is consumed and the lock is released.
+    pub fn commit(mut self) -> Result<()> {
+        self.finished = true;
+        self.client.commit_with_token(self.token)
+    }
+
+    /// Rollback the transaction and release the lock.
+    ///
+    /// After this call, the transaction guard is consumed and the lock is released.
+    pub fn rollback(mut self) -> Result<()> {
+        self.finished = true;
+        self.client.rollback_with_token(self.token)
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Auto-rollback on drop (panic safety)
+            let _ = self.client.rollback_with_token(self.token);
+        }
     }
 }
