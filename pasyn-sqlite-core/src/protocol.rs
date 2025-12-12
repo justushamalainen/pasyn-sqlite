@@ -35,6 +35,10 @@ pub enum RequestType {
     Shutdown = 8,
     /// Execute same SQL with multiple parameter sets (executemany)
     ExecuteMany = 9,
+    /// Acquire exclusive transaction lock (returns token)
+    AcquireTransactionLock = 10,
+    /// Release exclusive transaction lock
+    ReleaseTransactionLock = 11,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -51,6 +55,8 @@ impl TryFrom<u8> for RequestType {
             7 => Ok(RequestType::Ping),
             8 => Ok(RequestType::Shutdown),
             9 => Ok(RequestType::ExecuteMany),
+            10 => Ok(RequestType::AcquireTransactionLock),
+            11 => Ok(RequestType::ReleaseTransactionLock),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown request type: {}", value),
@@ -94,6 +100,8 @@ pub struct Request {
     pub params: Vec<Value>,
     /// Multiple parameter sets for ExecuteMany
     pub params_batch: Vec<Vec<Value>>,
+    /// Transaction token for exclusive lock operations
+    pub transaction_token: Option<u64>,
 }
 
 impl Request {
@@ -105,6 +113,7 @@ impl Request {
             sql: Some(sql.into()),
             params,
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -116,6 +125,7 @@ impl Request {
             sql: Some(sql.into()),
             params,
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -127,6 +137,7 @@ impl Request {
             sql: Some(sql.into()),
             params: Vec::new(),
             params_batch,
+            transaction_token: None,
         }
     }
 
@@ -138,6 +149,7 @@ impl Request {
             sql: Some(sql.into()),
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -149,6 +161,7 @@ impl Request {
             sql: None,
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -160,6 +173,7 @@ impl Request {
             sql: None,
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -171,6 +185,7 @@ impl Request {
             sql: None,
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -182,6 +197,7 @@ impl Request {
             sql: None,
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
         }
     }
 
@@ -193,12 +209,43 @@ impl Request {
             sql: None,
             params: Vec::new(),
             params_batch: Vec::new(),
+            transaction_token: None,
+        }
+    }
+
+    /// Create a request to acquire exclusive transaction lock
+    pub fn acquire_transaction_lock() -> Self {
+        Request {
+            request_id: 0,
+            request_type: RequestType::AcquireTransactionLock,
+            sql: None,
+            params: Vec::new(),
+            params_batch: Vec::new(),
+            transaction_token: None,
+        }
+    }
+
+    /// Create a request to release exclusive transaction lock
+    pub fn release_transaction_lock(token: u64) -> Self {
+        Request {
+            request_id: 0,
+            request_type: RequestType::ReleaseTransactionLock,
+            sql: None,
+            params: Vec::new(),
+            params_batch: Vec::new(),
+            transaction_token: Some(token),
         }
     }
 
     /// Set the request ID
     pub fn with_id(mut self, id: u64) -> Self {
         self.request_id = id;
+        self
+    }
+
+    /// Set the transaction token
+    pub fn with_token(mut self, token: u64) -> Self {
+        self.transaction_token = Some(token);
         self
     }
 
@@ -241,6 +288,17 @@ impl Request {
             buf.extend_from_slice(&(params.len() as u32).to_le_bytes());
             for param in params {
                 serialize_value(&mut buf, param);
+            }
+        }
+
+        // Transaction token (1 byte flag + optional 8 bytes)
+        match self.transaction_token {
+            Some(token) => {
+                buf.push(1); // has token
+                buf.extend_from_slice(&token.to_le_bytes());
+            }
+            None => {
+                buf.push(0); // no token
             }
         }
 
@@ -327,12 +385,29 @@ impl Request {
             params_batch.push(param_set);
         }
 
+        // Transaction token (1 byte flag + optional 8 bytes)
+        // For backwards compatibility, treat EOF as no token
+        let transaction_token = {
+            let mut has_token = [0u8; 1];
+            match reader.read_exact(&mut has_token) {
+                Ok(()) if has_token[0] == 1 => {
+                    let mut token_bytes = [0u8; 8];
+                    reader.read_exact(&mut token_bytes)?;
+                    Some(u64::from_le_bytes(token_bytes))
+                }
+                Ok(()) => None, // has_token[0] == 0
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
+                Err(e) => return Err(e),
+            }
+        };
+
         Ok(Request {
             request_id,
             request_type,
             sql,
             params,
             params_batch,
+            transaction_token,
         })
     }
 }
@@ -346,6 +421,8 @@ pub struct Response {
     pub rows_affected: i64,
     pub last_insert_rowid: i64,
     pub error_message: Option<String>,
+    /// Transaction token (returned when lock is acquired)
+    pub transaction_token: Option<u64>,
 }
 
 impl Response {
@@ -357,6 +434,7 @@ impl Response {
             rows_affected,
             last_insert_rowid,
             error_message: None,
+            transaction_token: None,
         }
     }
 
@@ -368,6 +446,7 @@ impl Response {
             rows_affected: 0,
             last_insert_rowid: 0,
             error_message: Some(message.into()),
+            transaction_token: None,
         }
     }
 
@@ -376,9 +455,27 @@ impl Response {
         Self::ok(0, 0)
     }
 
+    /// Create a success response with a transaction token
+    pub fn ok_with_token(token: u64) -> Self {
+        Response {
+            request_id: 0,
+            status: ResponseStatus::Ok,
+            rows_affected: 0,
+            last_insert_rowid: 0,
+            error_message: None,
+            transaction_token: Some(token),
+        }
+    }
+
     /// Set the request ID (echoed from request)
     pub fn with_id(mut self, id: u64) -> Self {
         self.request_id = id;
+        self
+    }
+
+    /// Set the transaction token
+    pub fn with_token(mut self, token: u64) -> Self {
+        self.transaction_token = Some(token);
         self
     }
 
@@ -409,6 +506,17 @@ impl Response {
             buf.extend_from_slice(msg_bytes);
         } else {
             buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+
+        // Transaction token (1 byte flag + optional 8 bytes)
+        match self.transaction_token {
+            Some(token) => {
+                buf.push(1); // has token
+                buf.extend_from_slice(&token.to_le_bytes());
+            }
+            None => {
+                buf.push(0); // no token
+            }
         }
 
         buf
@@ -477,12 +585,29 @@ impl Response {
             None
         };
 
+        // Transaction token (1 byte flag + optional 8 bytes)
+        // For backwards compatibility, treat EOF as no token
+        let transaction_token = {
+            let mut has_token = [0u8; 1];
+            match reader.read_exact(&mut has_token) {
+                Ok(()) if has_token[0] == 1 => {
+                    let mut token_bytes = [0u8; 8];
+                    reader.read_exact(&mut token_bytes)?;
+                    Some(u64::from_le_bytes(token_bytes))
+                }
+                Ok(()) => None, // has_token[0] == 0
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
+                Err(e) => return Err(e),
+            }
+        };
+
         Ok(Response {
             request_id,
             status,
             rows_affected,
             last_insert_rowid,
             error_message,
+            transaction_token,
         })
     }
 

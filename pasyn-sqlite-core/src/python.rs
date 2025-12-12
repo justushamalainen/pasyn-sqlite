@@ -900,6 +900,202 @@ impl PyMultiplexedClient {
 
         py.allow_threads(move || client.shutdown().map_err(to_py_err))
     }
+
+    /// Acquire an exclusive transaction lock.
+    ///
+    /// Returns a Transaction object that holds the lock. While the lock is held,
+    /// no other clients can perform write operations. The transaction must be
+    /// committed or rolled back within the server's timeout period (default: 1 second).
+    ///
+    /// Example:
+    /// ```python
+    /// tx = client.begin_exclusive()
+    /// try:
+    ///     tx.execute("INSERT INTO users VALUES (?, ?)", [1, "Alice"])
+    ///     tx.execute("INSERT INTO users VALUES (?, ?)", [2, "Bob"])
+    ///     tx.commit()
+    /// except Exception:
+    ///     tx.rollback()
+    ///     raise
+    /// ```
+    fn begin_exclusive(&self, py: Python<'_>) -> PyResult<PyTransaction> {
+        let client = self.client.clone();
+
+        py.allow_threads(move || {
+            let tx = client.begin_exclusive().map_err(to_py_err)?;
+            let token = tx.token();
+            // We need to prevent the Transaction from rolling back when dropped
+            // by converting it to just the token
+            std::mem::forget(tx);
+            Ok(PyTransaction {
+                client,
+                token,
+                finished: false,
+            })
+        })
+    }
+}
+
+/// An exclusive transaction guard.
+///
+/// This class represents an exclusive transaction lock. While this transaction exists,
+/// no other clients can perform write operations on the database.
+///
+/// The transaction must be explicitly committed with `commit()`. If the object
+/// is dropped (e.g., garbage collected) without committing, the transaction will
+/// be automatically rolled back.
+///
+/// Can be used as a context manager:
+/// ```python
+/// with client.begin_exclusive() as tx:
+///     tx.execute("INSERT INTO users VALUES (?, ?)", [1, "Alice"])
+///     tx.commit()
+/// ```
+#[pyclass(name = "Transaction")]
+pub struct PyTransaction {
+    client: Arc<RustMultiplexedClient>,
+    token: u64,
+    finished: bool,
+}
+
+#[pymethods]
+impl PyTransaction {
+    /// Get the transaction token (for debugging/logging).
+    #[getter]
+    fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Check if the transaction has been finished (committed or rolled back).
+    #[getter]
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Execute a SQL statement within this transaction.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<i64> {
+        if self.finished {
+            return Err(PyRuntimeError::new_err("Transaction already finished"));
+        }
+        let params = extract_params(py, params)?;
+        let client = self.client.clone();
+        let token = self.token;
+
+        py.allow_threads(move || {
+            client
+                .execute_with_token(&sql, params, token)
+                .map(|rows| rows as i64)
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Execute a SQL statement and return the last insert rowid.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_returning_rowid(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<i64> {
+        if self.finished {
+            return Err(PyRuntimeError::new_err("Transaction already finished"));
+        }
+        let params = extract_params(py, params)?;
+        let client = self.client.clone();
+        let token = self.token;
+
+        py.allow_threads(move || {
+            client
+                .execute_returning_rowid_with_token(&sql, params, token)
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Execute multiple SQL statements (batch/script) within this transaction.
+    fn executescript(&self, py: Python<'_>, sql: String) -> PyResult<()> {
+        if self.finished {
+            return Err(PyRuntimeError::new_err("Transaction already finished"));
+        }
+        let client = self.client.clone();
+        let token = self.token;
+
+        py.allow_threads(move || {
+            client
+                .execute_batch_with_token(&sql, token)
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Commit the transaction and release the lock.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.finished {
+            return Err(PyRuntimeError::new_err("Transaction already finished"));
+        }
+        let client = self.client.clone();
+        let token = self.token;
+
+        py.allow_threads(move || client.commit_with_token(token).map_err(to_py_err))?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Rollback the transaction and release the lock.
+    fn rollback(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.finished {
+            return Err(PyRuntimeError::new_err("Transaction already finished"));
+        }
+        let client = self.client.clone();
+        let token = self.token;
+
+        py.allow_threads(move || client.rollback_with_token(token).map_err(to_py_err))?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Context manager support: enter
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Context manager support: exit (auto-rollback if not committed)
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        // If already finished, nothing to do
+        if self.finished {
+            return Ok(false);
+        }
+
+        // If there was an exception, rollback
+        if exc_type.is_some() {
+            let _ = self.rollback(py);
+        }
+        // If no exception but not committed, also rollback
+        else if !self.finished {
+            let _ = self.rollback(py);
+        }
+
+        Ok(false) // Don't suppress exceptions
+    }
+}
+
+impl Drop for PyTransaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Auto-rollback on drop (best effort, ignore errors)
+            let _ = self.client.rollback_with_token(self.token);
+        }
+    }
 }
 
 /// Create a multiplexed client (convenience function).
@@ -921,6 +1117,9 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Multiplexed client class
     m.add_class::<PyMultiplexedClient>()?;
+
+    // Transaction class
+    m.add_class::<PyTransaction>()?;
 
     // Connection functions
     m.add_function(wrap_pyfunction!(connect, m)?)?;

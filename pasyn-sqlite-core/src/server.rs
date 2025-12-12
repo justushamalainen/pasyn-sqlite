@@ -9,15 +9,19 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::connection::Connection;
 use crate::protocol::{Request, RequestType, Response};
+
+/// Default transaction lock timeout in milliseconds
+const DEFAULT_TX_LOCK_TIMEOUT_MS: u64 = 1000;
 
 /// Configuration for the writer server
 #[derive(Debug, Clone)]
@@ -34,6 +38,8 @@ pub struct ServerConfig {
     pub max_batch_size: usize,
     /// Enable write batching with savepoints (default: true)
     pub enable_batching: bool,
+    /// Transaction lock timeout in milliseconds (default: 1000)
+    pub tx_lock_timeout_ms: u64,
 }
 
 impl ServerConfig {
@@ -46,6 +52,7 @@ impl ServerConfig {
             wal_mode: true,
             max_batch_size: 100,
             enable_batching: true,
+            tx_lock_timeout_ms: DEFAULT_TX_LOCK_TIMEOUT_MS,
         }
     }
 
@@ -73,6 +80,12 @@ impl ServerConfig {
         self
     }
 
+    /// Set transaction lock timeout in milliseconds
+    pub fn tx_lock_timeout(mut self, ms: u64) -> Self {
+        self.tx_lock_timeout_ms = ms;
+        self
+    }
+
     /// Generate a default socket path based on the database path
     pub fn default_socket_path(database_path: impl AsRef<Path>) -> PathBuf {
         let db_path = database_path.as_ref();
@@ -85,6 +98,16 @@ impl ServerConfig {
             PathBuf::from(socket_name)
         }
     }
+}
+
+/// State for an exclusive transaction lock
+struct TransactionLockState {
+    /// Client ID that holds the lock
+    holder_client_id: usize,
+    /// Unique token for this lock
+    token: u64,
+    /// When the lock was acquired
+    acquired_at: Instant,
 }
 
 /// Client connection state
@@ -199,6 +222,11 @@ impl WriterServer {
         let mut clients: HashMap<usize, ClientState> = HashMap::new();
         let mut next_client_id = 1usize;
 
+        // Transaction lock state
+        let mut tx_lock: Option<TransactionLockState> = None;
+        let mut next_token: u64 = 1;
+        let tx_lock_timeout = Duration::from_millis(self.config.tx_lock_timeout_ms);
+
         println!(
             "Writer server started: socket={}, db={}",
             self.config.socket_path.display(),
@@ -207,6 +235,26 @@ impl WriterServer {
 
         // Main event loop
         while !self.is_shutdown() {
+            // Check for transaction lock timeout
+            if let Some(ref lock_state) = tx_lock {
+                if lock_state.acquired_at.elapsed() > tx_lock_timeout {
+                    // Timeout! Rollback and release lock
+                    eprintln!(
+                        "Transaction lock timeout for client {} (token {}), rolling back",
+                        lock_state.holder_client_id, lock_state.token
+                    );
+                    let _ = conn.execute_batch("ROLLBACK");
+
+                    // Send timeout error to lock holder if still connected
+                    if let Some(client) = clients.get_mut(&lock_state.holder_client_id) {
+                        let response = Response::error("Transaction timeout - rolled back");
+                        let _ = self.send_response(&mut client.stream, &response);
+                    }
+
+                    tx_lock = None;
+                }
+            }
+
             // Build poll fds array: listener + all clients
             let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(1 + clients.len());
 
@@ -321,12 +369,33 @@ impl WriterServer {
 
             // Remove disconnected clients
             for client_id in &clients_to_remove {
+                // If this client holds the transaction lock, rollback and release
+                if let Some(ref lock_state) = tx_lock {
+                    if lock_state.holder_client_id == *client_id {
+                        eprintln!(
+                            "Client {} disconnected while holding transaction lock (token {}), rolling back",
+                            client_id, lock_state.token
+                        );
+                        let _ = conn.execute_batch("ROLLBACK");
+                        tx_lock = None;
+                    }
+                }
                 clients.remove(client_id);
             }
 
-            // Process all pending requests as a batch
+            // Process all pending requests
             if !all_pending.is_empty() {
-                let responses = self.process_batch_multi_client(&conn, &all_pending);
+                let mut responses: Vec<Response> = Vec::with_capacity(all_pending.len());
+
+                for pending in &all_pending {
+                    let response = self.process_request_with_lock(
+                        &conn,
+                        pending,
+                        &mut tx_lock,
+                        &mut next_token,
+                    );
+                    responses.push(response);
+                }
 
                 // Send responses back to respective clients
                 for (pending, response) in all_pending.iter().zip(responses.iter()) {
@@ -424,6 +493,195 @@ impl WriterServer {
         // Restore non-blocking
         stream.set_nonblocking(true)?;
         Ok(())
+    }
+
+    /// Process a request with transaction lock handling
+    fn process_request_with_lock(
+        &self,
+        conn: &Connection,
+        pending: &PendingRequest,
+        tx_lock: &mut Option<TransactionLockState>,
+        next_token: &mut u64,
+    ) -> Response {
+        let request = &pending.request;
+        let client_id = pending.client_id;
+
+        match request.request_type {
+            RequestType::AcquireTransactionLock => {
+                // Check if lock is already held
+                if let Some(ref lock_state) = tx_lock {
+                    return Response::error(format!(
+                        "Transaction lock held by another client (client {})",
+                        lock_state.holder_client_id
+                    ))
+                    .with_id(request.request_id);
+                }
+
+                // Acquire the lock and begin transaction
+                match conn.execute_batch("BEGIN IMMEDIATE") {
+                    Ok(()) => {
+                        let token = *next_token;
+                        *next_token += 1;
+
+                        *tx_lock = Some(TransactionLockState {
+                            holder_client_id: client_id,
+                            token,
+                            acquired_at: Instant::now(),
+                        });
+
+                        Response::ok_with_token(token).with_id(request.request_id)
+                    }
+                    Err(e) => {
+                        Response::error(format!("Failed to begin transaction: {}", e))
+                            .with_id(request.request_id)
+                    }
+                }
+            }
+
+            RequestType::ReleaseTransactionLock => {
+                // Validate token
+                let request_token = match request.transaction_token {
+                    Some(t) => t,
+                    None => {
+                        return Response::error("Missing transaction token")
+                            .with_id(request.request_id);
+                    }
+                };
+
+                match tx_lock {
+                    Some(ref lock_state) if lock_state.token == request_token => {
+                        // Valid token - rollback (release without commit)
+                        let _ = conn.execute_batch("ROLLBACK");
+                        *tx_lock = None;
+                        Response::simple_ok().with_id(request.request_id)
+                    }
+                    Some(ref lock_state) => {
+                        Response::error(format!(
+                            "Invalid transaction token (expected {}, got {})",
+                            lock_state.token, request_token
+                        ))
+                        .with_id(request.request_id)
+                    }
+                    None => {
+                        Response::error("No transaction lock held").with_id(request.request_id)
+                    }
+                }
+            }
+
+            RequestType::Commit => {
+                // Check if this is a commit with token (exclusive transaction)
+                if let Some(request_token) = request.transaction_token {
+                    match tx_lock {
+                        Some(ref lock_state) if lock_state.token == request_token => {
+                            // Valid token - commit and release lock
+                            let result = conn.execute_batch("COMMIT");
+                            *tx_lock = None;
+
+                            match result {
+                                Ok(()) => Response::simple_ok().with_id(request.request_id),
+                                Err(e) => {
+                                    Response::error(format!("Commit failed: {}", e))
+                                        .with_id(request.request_id)
+                                }
+                            }
+                        }
+                        Some(ref lock_state) => {
+                            Response::error(format!(
+                                "Invalid transaction token (expected {}, got {})",
+                                lock_state.token, request_token
+                            ))
+                            .with_id(request.request_id)
+                        }
+                        None => Response::error("No transaction lock held")
+                            .with_id(request.request_id),
+                    }
+                } else {
+                    // No token - check if someone else holds lock
+                    if tx_lock.is_some() {
+                        return Response::error("Database locked by exclusive transaction")
+                            .with_id(request.request_id);
+                    }
+                    // Normal commit
+                    self.process_request(conn, request).with_id(request.request_id)
+                }
+            }
+
+            RequestType::Rollback => {
+                // Check if this is a rollback with token (exclusive transaction)
+                if let Some(request_token) = request.transaction_token {
+                    match tx_lock {
+                        Some(ref lock_state) if lock_state.token == request_token => {
+                            // Valid token - rollback and release lock
+                            let result = conn.execute_batch("ROLLBACK");
+                            *tx_lock = None;
+
+                            match result {
+                                Ok(()) => Response::simple_ok().with_id(request.request_id),
+                                Err(e) => {
+                                    Response::error(format!("Rollback failed: {}", e))
+                                        .with_id(request.request_id)
+                                }
+                            }
+                        }
+                        Some(ref lock_state) => {
+                            Response::error(format!(
+                                "Invalid transaction token (expected {}, got {})",
+                                lock_state.token, request_token
+                            ))
+                            .with_id(request.request_id)
+                        }
+                        None => Response::error("No transaction lock held")
+                            .with_id(request.request_id),
+                    }
+                } else {
+                    // No token - check if someone else holds lock
+                    if tx_lock.is_some() {
+                        return Response::error("Database locked by exclusive transaction")
+                            .with_id(request.request_id);
+                    }
+                    // Normal rollback
+                    self.process_request(conn, request).with_id(request.request_id)
+                }
+            }
+
+            // Write operations - check lock
+            RequestType::Execute
+            | RequestType::ExecuteReturningRowId
+            | RequestType::ExecuteBatch
+            | RequestType::ExecuteMany
+            | RequestType::BeginTransaction => {
+                if let Some(ref lock_state) = tx_lock {
+                    // Lock is held - check if this client has the token
+                    match request.transaction_token {
+                        Some(token) if token == lock_state.token => {
+                            // Valid token - allow the operation
+                            self.process_request(conn, request).with_id(request.request_id)
+                        }
+                        Some(token) => {
+                            // Wrong token
+                            Response::error(format!(
+                                "Invalid transaction token (expected {}, got {})",
+                                lock_state.token, token
+                            ))
+                            .with_id(request.request_id)
+                        }
+                        None => {
+                            // No token but lock is held by someone
+                            Response::error("Database locked by exclusive transaction")
+                                .with_id(request.request_id)
+                        }
+                    }
+                } else {
+                    // No lock held - allow normal operation
+                    self.process_request(conn, request).with_id(request.request_id)
+                }
+            }
+
+            // Non-write operations - always allowed
+            RequestType::Ping | RequestType::Shutdown => {
+                self.process_request(conn, request).with_id(request.request_id)
+            }
+        }
     }
 
     /// Process a batch of requests from multiple clients
@@ -630,6 +888,10 @@ impl WriterServer {
             },
             RequestType::Ping => Response::simple_ok(),
             RequestType::Shutdown => Response::simple_ok(),
+            // These are handled by process_request_with_lock
+            RequestType::AcquireTransactionLock | RequestType::ReleaseTransactionLock => {
+                Response::error("Transaction lock operations must go through process_request_with_lock")
+            }
         }
     }
 
