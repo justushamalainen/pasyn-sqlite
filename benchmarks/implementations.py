@@ -6,10 +6,11 @@ import asyncio
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Coroutine, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Queue
-from typing import Any, Callable, Coroutine, Sequence
+from typing import Any, Callable
 
 import pasyn_sqlite_core
 
@@ -28,9 +29,7 @@ class BaseSQLiteImplementation(ABC):
         pass
 
     @abstractmethod
-    async def executemany(
-        self, sql: str, parameters: Sequence[Sequence[Any]]
-    ) -> None:
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
         """Execute SQL with multiple parameter sets."""
         pass
 
@@ -53,7 +52,7 @@ class BaseSQLiteImplementation(ABC):
         await self.execute("ROLLBACK")
 
     async def run_in_transaction(
-        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+        self, operations: Callable[[BaseSQLiteImplementation], Coroutine[Any, Any, Any]]
     ) -> None:
         """Run operations within a transaction."""
         await self.begin_transaction()
@@ -64,7 +63,7 @@ class BaseSQLiteImplementation(ABC):
             await self.rollback()
             raise
 
-    async def __aenter__(self) -> "BaseSQLiteImplementation":
+    async def __aenter__(self) -> BaseSQLiteImplementation:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -82,7 +81,8 @@ class MainThreadSQLite(BaseSQLiteImplementation):
         self._conn: sqlite3.Connection | None = None
 
     async def setup(self, db_path: str) -> None:
-        self._conn = sqlite3.connect(db_path)
+        # Use isolation_level=None for autocommit mode - each statement is its own transaction
+        self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
@@ -91,9 +91,7 @@ class MainThreadSQLite(BaseSQLiteImplementation):
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def executemany(
-        self, sql: str, parameters: Sequence[Sequence[Any]]
-    ) -> None:
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
         assert self._conn is not None
         self._conn.executemany(sql, parameters)
 
@@ -141,7 +139,9 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         await self._submit(lambda conn: None)
 
     def _worker_loop(self) -> None:
-        self._conn = sqlite3.connect(self._db_path)
+        # Use isolation_level=None for autocommit mode - each statement is its own transaction
+        # This prevents implicit batching when multiple concurrent tasks submit writes
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
@@ -172,9 +172,7 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
 
         return await self._submit(_execute)
 
-    async def executemany(
-        self, sql: str, parameters: Sequence[Sequence[Any]]
-    ) -> None:
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
         def _executemany(conn: sqlite3.Connection) -> None:
             conn.executemany(sql, parameters)
 
@@ -184,7 +182,7 @@ class SingleThreadSQLite(BaseSQLiteImplementation):
         await self._submit(lambda conn: conn.commit())
 
     async def run_in_transaction(
-        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+        self, operations: Callable[[BaseSQLiteImplementation], Coroutine[Any, Any, Any]]
     ) -> None:
         """Run operations within a transaction - serialized with lock."""
         assert self._tx_lock is not None
@@ -229,9 +227,7 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         # Create multiplexed client for writes
         self._client = pasyn_sqlite_core.MultiplexedClient(self._server.socket_path)
         # Create local read-only connection for reads
-        self._read_conn = pasyn_sqlite_core.connect(
-            db_path, pasyn_sqlite_core.OpenFlags.readonly()
-        )
+        self._read_conn = pasyn_sqlite_core.connect(db_path, pasyn_sqlite_core.OpenFlags.readonly())
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
         assert self._client is not None
@@ -246,9 +242,7 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
             self._client.execute(sql, list(parameters))
             return []
 
-    async def executemany(
-        self, sql: str, parameters: Sequence[Sequence[Any]]
-    ) -> None:
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
         assert self._client is not None
         # Use execute_many for efficient batched execution
         # This sends all parameters in a single request
@@ -277,7 +271,7 @@ class MultiplexedSQLite(BaseSQLiteImplementation):
         # If not in transaction, rollback is a no-op
 
     async def run_in_transaction(
-        self, operations: Callable[["BaseSQLiteImplementation"], Coroutine[Any, Any, Any]]
+        self, operations: Callable[[BaseSQLiteImplementation], Coroutine[Any, Any, Any]]
     ) -> None:
         """Run operations within a transaction."""
         await self.begin_transaction()

@@ -4,7 +4,7 @@
 import argparse
 import sys
 
-from common import ROOT_DIR, RUST_CORE_DIR, print_error, print_header, print_success, run
+from common import RUST_CORE_DIR, print_error, print_header, print_success, run
 
 
 def build_python() -> bool:
@@ -38,15 +38,9 @@ def build_rust(release: bool = True) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build pasyn-sqlite packages")
-    parser.add_argument(
-        "--python", action="store_true", help="Build Python package only"
-    )
-    parser.add_argument(
-        "--rust", action="store_true", help="Build Rust core package only"
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Build Rust in debug mode"
-    )
+    parser.add_argument("--python", action="store_true", help="Build Python package only")
+    parser.add_argument("--rust", action="store_true", help="Build Rust core package only")
+    parser.add_argument("--debug", action="store_true", help="Build Rust in debug mode")
     args = parser.parse_args()
 
     # Default to building both if neither specified

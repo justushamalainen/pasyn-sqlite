@@ -1,6 +1,7 @@
 """Type stubs for pasyn_sqlite_core"""
 
-from typing import Any, List, Optional, Tuple, Union, Sequence
+from collections.abc import Sequence
+from typing import Any, List, Optional, Tuple, Union
 
 # Type aliases
 SqliteValue = Union[None, int, float, str, bytes]
@@ -9,6 +10,7 @@ SqliteParams = Optional[Union[Sequence[SqliteValue], dict[str, SqliteValue]]]
 
 class SqliteError(Exception):
     """Exception raised for SQLite errors."""
+
     pass
 
 class OpenFlags:
@@ -41,8 +43,7 @@ class OpenFlags:
         """Add shared cache flag."""
         ...
 
-    def __or__(self, other: OpenFlags) -> OpenFlags:
-        ...
+    def __or__(self, other: OpenFlags) -> OpenFlags: ...
 
 class Cursor:
     """Database cursor for iterating over query results."""
@@ -68,8 +69,7 @@ class Cursor:
         """Fetch all remaining rows."""
         ...
 
-    def __iter__(self) -> Cursor:
-        ...
+    def __iter__(self) -> Cursor: ...
 
 class Connection:
     """SQLite database connection."""
@@ -152,16 +152,13 @@ class Connection:
         """Close the connection."""
         ...
 
-    def __enter__(self) -> Connection:
-        ...
-
+    def __enter__(self) -> Connection: ...
     def __exit__(
         self,
         exc_type: Optional[type],
         exc_val: Optional[BaseException],
         exc_tb: Optional[Any],
-    ) -> bool:
-        ...
+    ) -> bool: ...
 
 def connect(path: str, flags: Optional[OpenFlags] = None) -> Connection:
     """Connect to a database (convenience function)."""
@@ -304,8 +301,7 @@ class HybridConnection:
         ...
 
 def start_writer_server(
-    database_path: str,
-    socket_path: Optional[str] = None
+    database_path: str, socket_path: Optional[str] = None
 ) -> WriterServerHandle:
     """
     Start a writer server that handles all write operations via Unix socket.
@@ -382,7 +378,6 @@ class AsyncWriterClient:
         """Shutdown the server asynchronously."""
         ...
 
-
 class AsyncHybridConnection:
     """
     True async hybrid connection - reads locally, writes via async socket.
@@ -441,16 +436,13 @@ class AsyncHybridConnection:
         """Query data locally and return the first row."""
         ...
 
-
 async def async_hybrid_connect(database_path: str, socket_path: str) -> AsyncHybridConnection:
     """Create and connect an async hybrid connection."""
     ...
 
-
 async def async_writer_client(socket_path: str) -> AsyncWriterClient:
     """Create and connect an async writer client."""
     ...
-
 
 # =============================================================================
 # Protocol Serialization (for custom async implementations)

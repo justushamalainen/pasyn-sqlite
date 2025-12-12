@@ -209,7 +209,10 @@ impl TryFrom<Value> for i32 {
     type Error = &'static str;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        value.as_integer().map(|i| i as i32).ok_or("Cannot convert to integer")
+        value
+            .as_integer()
+            .map(|i| i as i32)
+            .ok_or("Cannot convert to integer")
     }
 }
 

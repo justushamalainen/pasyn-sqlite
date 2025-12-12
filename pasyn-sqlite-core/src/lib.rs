@@ -69,9 +69,9 @@ pub mod statement;
 pub mod value;
 
 // Writer server architecture
+pub mod client;
 pub mod protocol;
 pub mod server;
-pub mod client;
 
 #[cfg(feature = "python")]
 pub mod python;
@@ -83,8 +83,8 @@ pub use statement::{ColumnType, RowRef, Rows, Statement};
 pub use value::{Params, Value};
 
 // Server/client re-exports
-pub use server::{ServerConfig, ServerHandle, WriterServer};
 pub use client::MultiplexedClient;
+pub use server::{ServerConfig, ServerHandle, WriterServer};
 
 /// Get the SQLite library version string
 pub fn sqlite_version() -> &'static str {
@@ -156,14 +156,15 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
 
         // Create table
-        conn.execute_batch(
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value REAL)",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value REAL)")
+            .unwrap();
 
         // Insert
-        conn.execute("INSERT INTO test (name, value) VALUES (?1, ?2)", ["foo", "1.5"])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO test (name, value) VALUES (?1, ?2)",
+            ["foo", "1.5"],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO test (name, value) VALUES (?1, ?2)",
             [Value::Text("bar".to_string()), Value::Real(2.5)],
@@ -171,7 +172,9 @@ mod tests {
         .unwrap();
 
         // Query
-        let mut stmt = conn.prepare("SELECT name, value FROM test ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name, value FROM test ORDER BY id")
+            .unwrap();
 
         assert!(stmt.step().unwrap());
         assert_eq!(stmt.column_text(0).unwrap(), "foo");
@@ -186,7 +189,8 @@ mod tests {
     #[test]
     fn test_transaction_commit() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE test (id INTEGER)").unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER)")
+            .unwrap();
 
         {
             let tx = conn.begin_transaction().unwrap();
@@ -206,7 +210,8 @@ mod tests {
     #[test]
     fn test_transaction_rollback() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE test (id INTEGER)").unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER)")
+            .unwrap();
 
         {
             let tx = conn.begin_transaction().unwrap();

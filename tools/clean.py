@@ -4,7 +4,6 @@
 import argparse
 import shutil
 import sys
-from pathlib import Path
 
 from common import ROOT_DIR, RUST_CORE_DIR, RUST_POC_DIR, print_header, print_success
 
@@ -59,12 +58,8 @@ def clean_rust() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Clean pasyn-sqlite build artifacts")
-    parser.add_argument(
-        "--python", action="store_true", help="Clean Python artifacts only"
-    )
-    parser.add_argument(
-        "--rust", action="store_true", help="Clean Rust artifacts only"
-    )
+    parser.add_argument("--python", action="store_true", help="Clean Python artifacts only")
+    parser.add_argument("--rust", action="store_true", help="Clean Rust artifacts only")
     args = parser.parse_args()
 
     # Default to cleaning both if neither specified

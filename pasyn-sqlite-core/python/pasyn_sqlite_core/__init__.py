@@ -52,40 +52,41 @@ Multiplexed Client Example (thread-safe, automatic batching):
 import asyncio
 import socket
 import struct
-from typing import Any, List, Optional, Tuple, Sequence, Union
+from collections.abc import Sequence
+from typing import Any, List, Optional, Tuple, Union
 
 from .pasyn_sqlite_core import (
     # Classes
     Connection,
     Cursor,
+    # Multiplexed client (thread-safe with automatic batching)
+    MultiplexedClient,
     OpenFlags,
     SqliteError,
     # Writer Server classes
     WriterServerHandle,
-    # Multiplexed client (thread-safe with automatic batching)
-    MultiplexedClient,
-    multiplexed_client,
     # Connection functions
     connect,
-    # Server functions
-    start_writer_server,
     default_socket_path,
+    memory_highwater,
+    memory_used,
+    multiplexed_client,
+    parse_response,
+    serialize_begin_request,
+    serialize_commit_request,
     # Protocol serialization (for async I/O)
     serialize_execute_request,
     serialize_execute_returning_rowid_request,
     serialize_executescript_request,
-    serialize_begin_request,
-    serialize_commit_request,
-    serialize_rollback_request,
     serialize_ping_request,
+    serialize_rollback_request,
     serialize_shutdown_request,
-    parse_response,
+    sqlite_threadsafe,
     # Utility functions
     sqlite_version,
     sqlite_version_number,
-    sqlite_threadsafe,
-    memory_used,
-    memory_highwater,
+    # Server functions
+    start_writer_server,
 )
 
 # Type aliases
@@ -136,7 +137,7 @@ class AsyncWriterClient:
 
         # Read response length (4 bytes)
         length_bytes = await self._recv_exact(4)
-        response_length = struct.unpack('<I', length_bytes)[0]
+        response_length = struct.unpack("<I", length_bytes)[0]
 
         # Read response data
         response_data = await self._recv_exact(response_length)
@@ -149,7 +150,7 @@ class AsyncWriterClient:
         if not self._sock or not self._loop:
             raise RuntimeError("Not connected")
 
-        data = b''
+        data = b""
         while len(data) < n:
             chunk = await self._loop.sock_recv(self._sock, n - len(data))
             if not chunk:

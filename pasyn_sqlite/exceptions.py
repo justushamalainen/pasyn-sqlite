@@ -2,7 +2,6 @@
 
 import sqlite3
 
-
 # Re-export sqlite3 exceptions for convenience
 DatabaseError = sqlite3.DatabaseError
 DataError = sqlite3.DataError

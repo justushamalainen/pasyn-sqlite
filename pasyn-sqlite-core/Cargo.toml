@@ -22,6 +22,7 @@ python = ["dep:pyo3"]  # Enable Python bindings
 thiserror = "1.0"
 parking_lot = "0.12"
 once_cell = "1.19"
+libc = "0.2"
 
 # Python bindings (optional)
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }

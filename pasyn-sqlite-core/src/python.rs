@@ -6,15 +6,15 @@ use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
+use crate::client::MultiplexedClient as RustMultiplexedClient;
 use crate::connection::Connection as RustConnection;
 use crate::connection::OpenFlags as RustOpenFlags;
 use crate::error::Error as RustError;
 use crate::server::{ServerConfig, ServerHandle, WriterServer};
-use crate::client::MultiplexedClient as RustMultiplexedClient;
 use crate::value::Value as RustValue;
 
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 // Custom exception for SQLite errors
 pyo3::create_exception!(pasyn_sqlite_core, SqliteError, PyException);
@@ -63,14 +63,9 @@ fn extract_params(py: Python<'_>, params: Option<&Bound<'_, PyAny>>) -> PyResult
         None => Ok(Vec::new()),
         Some(obj) => {
             if let Ok(list) = obj.downcast::<PyList>() {
-                list.iter()
-                    .map(|item| py_to_value(py, &item))
-                    .collect()
+                list.iter().map(|item| py_to_value(py, &item)).collect()
             } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
-                tuple
-                    .iter()
-                    .map(|item| py_to_value(py, &item))
-                    .collect()
+                tuple.iter().map(|item| py_to_value(py, &item)).collect()
             } else if let Ok(dict) = obj.downcast::<PyDict>() {
                 // Named parameters - convert to positional for now
                 // TODO: Support named parameters properly
@@ -159,7 +154,9 @@ impl PyConnection {
     #[new]
     #[pyo3(signature = (path, flags=None))]
     fn new(path: &str, flags: Option<PyOpenFlags>) -> PyResult<Self> {
-        let flags = flags.map(|f| RustOpenFlags::from_bits(f.flags)).unwrap_or_default();
+        let flags = flags
+            .map(|f| RustOpenFlags::from_bits(f.flags))
+            .unwrap_or_default();
         let conn = RustConnection::open_with_flags(path, flags).map_err(to_py_err)?;
         Ok(PyConnection {
             conn: Arc::new(Mutex::new(conn)),
@@ -193,13 +190,19 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<usize> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.execute(sql, params).map_err(to_py_err)
     }
 
     /// Execute multiple SQL statements
     fn executescript(&self, sql: &str) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.execute_batch(sql).map_err(to_py_err)
     }
 
@@ -212,7 +215,10 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyList>> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         let mut stmt = conn.query(sql, params).map_err(to_py_err)?;
 
         let mut rows = Vec::new();
@@ -235,7 +241,10 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Py<PyTuple>>> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         let mut stmt = conn.query(sql, params).map_err(to_py_err)?;
 
         if stmt.step().map_err(to_py_err)? {
@@ -257,7 +266,10 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<PyCursor> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
 
         let stmt = conn.prepare(sql).map_err(to_py_err)?;
         let column_names: Vec<String> = (0..stmt.column_count())
@@ -275,59 +287,86 @@ impl PyConnection {
 
     /// Begin a transaction
     fn begin(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.execute_batch("BEGIN").map_err(to_py_err)
     }
 
     /// Commit the current transaction
     fn commit(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.execute_batch("COMMIT").map_err(to_py_err)
     }
 
     /// Rollback the current transaction
     fn rollback(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.execute_batch("ROLLBACK").map_err(to_py_err)
     }
 
     /// Check if in autocommit mode
     #[getter]
     fn in_transaction(&self) -> PyResult<bool> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(!conn.is_autocommit())
     }
 
     /// Get the last inserted row ID
     #[getter]
     fn last_insert_rowid(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(conn.last_insert_rowid())
     }
 
     /// Get the number of rows changed
     #[getter]
     fn changes(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(conn.changes())
     }
 
     /// Get total changes since connection opened
     #[getter]
     fn total_changes(&self) -> PyResult<i64> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(conn.total_changes())
     }
 
     /// Set busy timeout in milliseconds
     fn set_busy_timeout(&self, ms: i32) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.busy_timeout(ms).map_err(to_py_err)
     }
 
     /// Interrupt any pending operation
     fn interrupt(&self) -> PyResult<()> {
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         conn.interrupt();
         Ok(())
     }
@@ -336,7 +375,10 @@ impl PyConnection {
     fn close(&self) -> PyResult<()> {
         // The actual close happens when the Arc is dropped
         // For now, just verify we can get the lock
-        let _conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let _conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
         Ok(())
     }
 
@@ -379,8 +421,13 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let mut stmt = conn
+            .query(&self.sql, self.params.clone())
+            .map_err(to_py_err)?;
 
         let mut rows = Vec::new();
         while stmt.step().map_err(to_py_err)? {
@@ -399,8 +446,13 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let mut stmt = conn
+            .query(&self.sql, self.params.clone())
+            .map_err(to_py_err)?;
 
         if stmt.step().map_err(to_py_err)? {
             let row_values: Vec<PyObject> = (0..stmt.column_count())
@@ -421,8 +473,13 @@ impl PyCursor {
             self.execute()?;
         }
 
-        let conn = self.conn.lock().map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
-        let mut stmt = conn.query(&self.sql, self.params.clone()).map_err(to_py_err)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Lock poisoned"))?;
+        let mut stmt = conn
+            .query(&self.sql, self.params.clone())
+            .map_err(to_py_err)?;
 
         let mut rows = Vec::new();
         let mut count = 0;
@@ -455,7 +512,8 @@ impl PyCursor {
                         py.None(),
                         py.None(),
                     ],
-                ).unbind())
+                )
+                .unbind())
             })
             .collect::<PyResult<_>>()?;
 
@@ -535,9 +593,9 @@ impl PyWriterServerHandle {
     /// Wait for the server to stop
     fn join(&mut self) -> PyResult<()> {
         if let Some(handle) = self.handle.take() {
-            handle.join().map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to join server: {}", e))
-            })?;
+            handle
+                .join()
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to join server: {}", e)))?;
         }
         Ok(())
     }
@@ -545,9 +603,9 @@ impl PyWriterServerHandle {
     /// Shutdown and wait for the server to stop
     fn stop(&mut self) -> PyResult<()> {
         if let Some(handle) = self.handle.take() {
-            handle.stop().map_err(|e| {
-                PyRuntimeError::new_err(format!("Failed to stop server: {}", e))
-            })?;
+            handle
+                .stop()
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to stop server: {}", e)))?;
         }
         Ok(())
     }
@@ -556,18 +614,20 @@ impl PyWriterServerHandle {
 /// Start a writer server that handles all write operations via Unix socket
 #[pyfunction]
 #[pyo3(signature = (database_path, socket_path=None))]
-fn start_writer_server(database_path: &str, socket_path: Option<&str>) -> PyResult<PyWriterServerHandle> {
+fn start_writer_server(
+    database_path: &str,
+    socket_path: Option<&str>,
+) -> PyResult<PyWriterServerHandle> {
     let socket_path = socket_path
         .map(PathBuf::from)
         .unwrap_or_else(|| ServerConfig::default_socket_path(database_path));
 
-    let server = WriterServer::new(database_path, &socket_path).map_err(|e| {
-        PyRuntimeError::new_err(format!("Failed to create server: {}", e))
-    })?;
+    let server = WriterServer::new(database_path, &socket_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create server: {}", e)))?;
 
-    let handle = server.spawn().map_err(|e| {
-        PyRuntimeError::new_err(format!("Failed to start server: {}", e))
-    })?;
+    let handle = server
+        .spawn()
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to start server: {}", e)))?;
 
     // Give the server a moment to start
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -581,7 +641,9 @@ fn start_writer_server(database_path: &str, socket_path: Option<&str>) -> PyResu
 /// Get the default socket path for a database
 #[pyfunction]
 fn default_socket_path(database_path: &str) -> String {
-    ServerConfig::default_socket_path(database_path).to_string_lossy().to_string()
+    ServerConfig::default_socket_path(database_path)
+        .to_string_lossy()
+        .to_string()
 }
 
 // =============================================================================
@@ -687,9 +749,8 @@ fn serialize_shutdown_request(py: Python<'_>) -> Py<PyBytes> {
 /// Parse response from bytes, returns (success, rows_affected, last_insert_rowid, error_message)
 #[pyfunction]
 fn parse_response(py: Python<'_>, data: &[u8]) -> PyResult<(bool, i64, i64, Option<String>)> {
-    let response = Response::deserialize(data).map_err(|e| {
-        PyRuntimeError::new_err(format!("Failed to parse response: {}", e))
-    })?;
+    let response = Response::deserialize(data)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse response: {}", e)))?;
     Ok((
         response.is_ok(),
         response.rows_affected,
@@ -723,9 +784,8 @@ impl PyMultiplexedClient {
     /// Create a new multiplexed client connected to the given socket path.
     #[new]
     fn new(socket_path: &str) -> PyResult<Self> {
-        let client = RustMultiplexedClient::connect(socket_path).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to connect: {}", e))
-        })?;
+        let client = RustMultiplexedClient::connect(socket_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to connect: {}", e)))?;
         Ok(PyMultiplexedClient {
             client: Arc::new(client),
         })
@@ -736,24 +796,39 @@ impl PyMultiplexedClient {
     /// This method is thread-safe and can be called from multiple threads concurrently.
     /// The GIL is released during I/O operations.
     #[pyo3(signature = (sql, params=None))]
-    fn execute(&self, py: Python<'_>, sql: String, params: Option<&Bound<'_, PyAny>>) -> PyResult<i64> {
+    fn execute(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<i64> {
         let params = extract_params(py, params)?;
         let client = self.client.clone();
 
         // Release GIL during blocking I/O
         py.allow_threads(move || {
-            client.execute(&sql, params).map(|rows| rows as i64).map_err(to_py_err)
+            client
+                .execute(&sql, params)
+                .map(|rows| rows as i64)
+                .map_err(to_py_err)
         })
     }
 
     /// Execute a SQL statement and return the last insert rowid.
     #[pyo3(signature = (sql, params=None))]
-    fn execute_returning_rowid(&self, py: Python<'_>, sql: String, params: Option<&Bound<'_, PyAny>>) -> PyResult<i64> {
+    fn execute_returning_rowid(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<i64> {
         let params = extract_params(py, params)?;
         let client = self.client.clone();
 
         py.allow_threads(move || {
-            client.execute_returning_rowid(&sql, params).map_err(to_py_err)
+            client
+                .execute_returning_rowid(&sql, params)
+                .map_err(to_py_err)
         })
     }
 
@@ -762,7 +837,12 @@ impl PyMultiplexedClient {
     /// This is more efficient than calling execute() multiple times because
     /// the statement is prepared once and reused for each parameter set.
     /// Returns the total number of rows affected.
-    fn execute_many(&self, py: Python<'_>, sql: String, params_batch: &Bound<'_, PyList>) -> PyResult<i64> {
+    fn execute_many(
+        &self,
+        py: Python<'_>,
+        sql: String,
+        params_batch: &Bound<'_, PyList>,
+    ) -> PyResult<i64> {
         // Convert Python list of parameter lists to Vec<Vec<Value>>
         let batch: Vec<Vec<RustValue>> = params_batch
             .iter()
@@ -772,7 +852,10 @@ impl PyMultiplexedClient {
         let client = self.client.clone();
 
         py.allow_threads(move || {
-            client.execute_many(&sql, batch).map(|rows| rows as i64).map_err(to_py_err)
+            client
+                .execute_many(&sql, batch)
+                .map(|rows| rows as i64)
+                .map_err(to_py_err)
         })
     }
 
@@ -780,54 +863,42 @@ impl PyMultiplexedClient {
     fn executescript(&self, py: Python<'_>, sql: String) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.execute_batch(&sql).map_err(to_py_err)
-        })
+        py.allow_threads(move || client.execute_batch(&sql).map_err(to_py_err))
     }
 
     /// Begin a transaction.
     fn begin(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.begin_transaction().map_err(to_py_err)
-        })
+        py.allow_threads(move || client.begin_transaction().map_err(to_py_err))
     }
 
     /// Commit the current transaction.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.commit().map_err(to_py_err)
-        })
+        py.allow_threads(move || client.commit().map_err(to_py_err))
     }
 
     /// Rollback the current transaction.
     fn rollback(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.rollback().map_err(to_py_err)
-        })
+        py.allow_threads(move || client.rollback().map_err(to_py_err))
     }
 
     /// Ping the server to check if it's alive.
     fn ping(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.ping().map_err(to_py_err)
-        })
+        py.allow_threads(move || client.ping().map_err(to_py_err))
     }
 
     /// Request the server to shutdown.
     fn shutdown_server(&self, py: Python<'_>) -> PyResult<()> {
         let client = self.client.clone();
 
-        py.allow_threads(move || {
-            client.shutdown().map_err(to_py_err)
-        })
+        py.allow_threads(move || client.shutdown().map_err(to_py_err))
     }
 }
 
@@ -861,7 +932,10 @@ fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Protocol serialization functions (for async I/O)
     m.add_function(wrap_pyfunction!(serialize_execute_request, m)?)?;
-    m.add_function(wrap_pyfunction!(serialize_execute_returning_rowid_request, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        serialize_execute_returning_rowid_request,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(serialize_executescript_request, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_begin_request, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_commit_request, m)?)?;

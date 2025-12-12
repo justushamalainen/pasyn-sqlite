@@ -387,7 +387,9 @@ mod tests {
         conn.execute_batch("CREATE TABLE test (id INTEGER, name TEXT, data BLOB)")
             .unwrap();
 
-        let mut stmt = conn.prepare("INSERT INTO test VALUES (?1, ?2, ?3)").unwrap();
+        let mut stmt = conn
+            .prepare("INSERT INTO test VALUES (?1, ?2, ?3)")
+            .unwrap();
         stmt.bind(1, Value::Integer(42)).unwrap();
         stmt.bind(2, Value::Text("hello".to_string())).unwrap();
         stmt.bind(3, Value::Blob(vec![1, 2, 3])).unwrap();

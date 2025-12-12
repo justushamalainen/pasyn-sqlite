@@ -5,7 +5,7 @@ import argparse
 import glob
 import sys
 
-from common import ROOT_DIR, RUST_CORE_DIR, print_error, print_header, print_success, run
+from common import RUST_CORE_DIR, print_error, print_header, print_success, run
 
 
 def install_python(dev: bool = False) -> bool:
@@ -58,15 +58,11 @@ def install_rust_core() -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install pasyn-sqlite packages")
-    parser.add_argument(
-        "--dev", action="store_true", help="Install with development dependencies"
-    )
+    parser.add_argument("--dev", action="store_true", help="Install with development dependencies")
     parser.add_argument(
         "--rust", action="store_true", help="Also build and install Rust core package"
     )
-    parser.add_argument(
-        "--all", action="store_true", help="Install everything (Python + Rust)"
-    )
+    parser.add_argument("--all", action="store_true", help="Install everything (Python + Rust)")
     args = parser.parse_args()
 
     success = True
