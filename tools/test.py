@@ -11,7 +11,9 @@ def test_python(verbose: bool = False) -> bool:
     """Run Python tests."""
     print_header("Running Python tests")
     try:
-        cmd = ["pytest", "tests/"]
+        # Use sys.executable to ensure we use the same Python environment
+        # where pasyn_sqlite_core is installed
+        cmd = [sys.executable, "-m", "pytest", "tests/"]
         if verbose:
             cmd.append("-v")
         run(cmd)
