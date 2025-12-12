@@ -77,7 +77,7 @@ pub mod server;
 pub mod python;
 
 // Re-exports
-pub use connection::{Connection, FromColumn, OpenFlags, Row, Transaction};
+pub use connection::{Connection, FromColumn, OpenFlags, Row, ThreadSafeConnection, Transaction};
 pub use error::{Error, ErrorCode, Result};
 pub use statement::{ColumnType, RowRef, Rows, Statement};
 pub use value::{Params, Value};

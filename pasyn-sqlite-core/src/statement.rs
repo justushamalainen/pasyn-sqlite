@@ -271,6 +271,15 @@ impl Statement {
     pub fn is_busy(&self) -> bool {
         unsafe { ffi::sqlite3_stmt_busy(self.stmt) != 0 }
     }
+
+    /// Get the raw statement pointer
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the pointer is not used after the statement is dropped.
+    pub fn as_ptr(&self) -> *mut ffi::sqlite3_stmt {
+        self.stmt
+    }
 }
 
 impl Drop for Statement {
