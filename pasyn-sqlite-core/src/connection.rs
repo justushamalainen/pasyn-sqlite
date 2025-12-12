@@ -382,6 +382,14 @@ impl Connection {
         self.db
     }
 
+    /// Get the raw database pointer
+    ///
+    /// This is primarily used for statement caching. The pointer should
+    /// not be used after the Connection is dropped.
+    pub fn as_ptr(&self) -> *mut ffi::sqlite3 {
+        self.db
+    }
+
     /// Close the database connection explicitly
     ///
     /// This is called automatically on drop, but can be called explicitly
@@ -602,6 +610,118 @@ impl ThreadSafeConnection {
         Statement::prepare(self.db, sql)
     }
 
+    /// Query using cached prepared statement (faster for repeated queries)
+    ///
+    /// This method uses a thread-local statement cache to avoid re-preparing
+    /// statements that have been used before. The cache is keyed by SQL text.
+    ///
+    /// For best performance, use this for queries that are executed frequently
+    /// with different parameters.
+    pub fn query_cached<F, T>(&self, sql: &str, params: &[Value], mut f: F) -> Result<Vec<T>>
+    where
+        F: FnMut(*mut ffi::sqlite3_stmt) -> T,
+    {
+        let stmt = crate::cache::get_cached_statement(self.db, sql)?;
+
+        // Bind parameters
+        for (i, param) in params.iter().enumerate() {
+            let idx = (i + 1) as std::os::raw::c_int;
+            let rc = match param {
+                Value::Null => unsafe { ffi::sqlite3_bind_null(stmt, idx) },
+                Value::Integer(v) => unsafe { ffi::sqlite3_bind_int64(stmt, idx, *v) },
+                Value::Real(v) => unsafe { ffi::sqlite3_bind_double(stmt, idx, *v) },
+                Value::Text(s) => unsafe {
+                    ffi::sqlite3_bind_text(
+                        stmt,
+                        idx,
+                        s.as_ptr() as *const _,
+                        s.len() as std::os::raw::c_int,
+                        ffi::sqlite_transient(),
+                    )
+                },
+                Value::Blob(b) => unsafe {
+                    ffi::sqlite3_bind_blob(
+                        stmt,
+                        idx,
+                        b.as_ptr() as *const _,
+                        b.len() as std::os::raw::c_int,
+                        ffi::sqlite_transient(),
+                    )
+                },
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(unsafe { Error::from_db(self.db) });
+            }
+        }
+
+        // Execute and collect results
+        let mut results = Vec::new();
+        loop {
+            let rc = unsafe { ffi::sqlite3_step(stmt) };
+            match rc {
+                ffi::SQLITE_ROW => results.push(f(stmt)),
+                ffi::SQLITE_DONE => break,
+                _ => return Err(unsafe { Error::from_db(self.db) }),
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Query single row using cached prepared statement
+    ///
+    /// Similar to query_cached but stops after the first row.
+    pub fn query_cached_one<F, T>(&self, sql: &str, params: &[Value], f: F) -> Result<Option<T>>
+    where
+        F: FnOnce(*mut ffi::sqlite3_stmt) -> T,
+    {
+        let stmt = crate::cache::get_cached_statement(self.db, sql)?;
+
+        // Bind parameters
+        for (i, param) in params.iter().enumerate() {
+            let idx = (i + 1) as std::os::raw::c_int;
+            let rc = match param {
+                Value::Null => unsafe { ffi::sqlite3_bind_null(stmt, idx) },
+                Value::Integer(v) => unsafe { ffi::sqlite3_bind_int64(stmt, idx, *v) },
+                Value::Real(v) => unsafe { ffi::sqlite3_bind_double(stmt, idx, *v) },
+                Value::Text(s) => unsafe {
+                    ffi::sqlite3_bind_text(
+                        stmt,
+                        idx,
+                        s.as_ptr() as *const _,
+                        s.len() as std::os::raw::c_int,
+                        ffi::sqlite_transient(),
+                    )
+                },
+                Value::Blob(b) => unsafe {
+                    ffi::sqlite3_bind_blob(
+                        stmt,
+                        idx,
+                        b.as_ptr() as *const _,
+                        b.len() as std::os::raw::c_int,
+                        ffi::sqlite_transient(),
+                    )
+                },
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(unsafe { Error::from_db(self.db) });
+            }
+        }
+
+        // Execute and return first result only
+        let rc = unsafe { ffi::sqlite3_step(stmt) };
+        match rc {
+            ffi::SQLITE_ROW => Ok(Some(f(stmt))),
+            ffi::SQLITE_DONE => Ok(None),
+            _ => Err(unsafe { Error::from_db(self.db) }),
+        }
+    }
+
+    /// Get the raw database pointer (for cache key)
+    pub fn as_ptr(&self) -> *mut ffi::sqlite3 {
+        self.db
+    }
+
     /// Execute the same SQL statement with multiple parameter sets
     pub fn execute_many(&self, sql: &str, params_batch: &[Vec<Value>]) -> Result<usize> {
         let mut stmt = Statement::prepare(self.db, sql)?;
@@ -664,6 +784,9 @@ impl ThreadSafeConnection {
 impl Drop for ThreadSafeConnection {
     fn drop(&mut self) {
         if !self.db.is_null() {
+            // Clear statement cache before closing connection
+            // (cached statements hold references to this db)
+            crate::cache::clear_cache_for_db(self.db);
             unsafe { ffi::sqlite3_close_v2(self.db) };
             self.db = ptr::null_mut();
         }

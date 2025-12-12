@@ -62,6 +62,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod cache;
 pub mod connection;
 pub mod error;
 pub mod ffi;

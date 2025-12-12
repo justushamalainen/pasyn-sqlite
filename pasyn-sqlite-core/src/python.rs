@@ -11,7 +11,6 @@ use crate::connection::OpenFlags as RustOpenFlags;
 use crate::connection::ThreadSafeConnection;
 use crate::error::Error as RustError;
 use crate::server::{ServerConfig, ServerHandle, WriterServer};
-use crate::statement::{ColumnType, Statement};
 use crate::value::Value as RustValue;
 
 use std::path::PathBuf;
@@ -47,37 +46,55 @@ fn py_to_value(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RustValue> {
     }
 }
 
-/// Convert a SQLite statement column directly to Python object
-/// This bypasses the intermediate RustValue allocation for better performance
+/// Convert all columns from raw statement pointer to Python tuple
+/// Used with cached statements
 #[inline]
-fn stmt_column_to_py(py: Python<'_>, stmt: &Statement, index: usize) -> PyObject {
-    match stmt.column_type(index) {
-        ColumnType::Null => py.None(),
-        ColumnType::Integer => stmt.column_int64(index).to_object(py),
-        ColumnType::Float => stmt.column_double(index).to_object(py),
-        ColumnType::Text => {
-            // Convert directly from SQLite text to Python string
-            // avoiding the intermediate Rust String allocation
-            match stmt.column_text(index) {
-                Ok(s) => s.to_object(py),
-                Err(_) => py.None(),
-            }
-        }
-        ColumnType::Blob => {
-            // Convert directly from SQLite blob to Python bytes
-            // avoiding the intermediate Vec<u8> allocation
-            let blob = stmt.column_blob(index);
-            PyBytes::new_bound(py, blob).into_any().unbind()
-        }
-    }
-}
+fn raw_stmt_to_py_tuple(py: Python<'_>, stmt: *mut crate::ffi::sqlite3_stmt) -> Py<PyTuple> {
+    use crate::ffi;
 
-/// Convert all columns of current row directly to Python tuple
-#[inline]
-fn stmt_row_to_py_tuple(py: Python<'_>, stmt: &Statement) -> Py<PyTuple> {
-    let count = stmt.column_count();
+    let count = unsafe { ffi::sqlite3_column_count(stmt) as usize };
     let values: Vec<PyObject> = (0..count)
-        .map(|i| stmt_column_to_py(py, stmt, i))
+        .map(|i| {
+            let col_type = unsafe { ffi::sqlite3_column_type(stmt, i as std::os::raw::c_int) };
+            match col_type {
+                ffi::SQLITE_NULL => py.None(),
+                ffi::SQLITE_INTEGER => {
+                    let v = unsafe { ffi::sqlite3_column_int64(stmt, i as std::os::raw::c_int) };
+                    v.to_object(py)
+                }
+                ffi::SQLITE_FLOAT => {
+                    let v = unsafe { ffi::sqlite3_column_double(stmt, i as std::os::raw::c_int) };
+                    v.to_object(py)
+                }
+                ffi::SQLITE_TEXT => {
+                    let ptr = unsafe { ffi::sqlite3_column_text(stmt, i as std::os::raw::c_int) };
+                    if ptr.is_null() {
+                        py.None()
+                    } else {
+                        let len =
+                            unsafe { ffi::sqlite3_column_bytes(stmt, i as std::os::raw::c_int) };
+                        let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                        match std::str::from_utf8(slice) {
+                            Ok(s) => s.to_object(py),
+                            Err(_) => py.None(),
+                        }
+                    }
+                }
+                ffi::SQLITE_BLOB => {
+                    let ptr = unsafe { ffi::sqlite3_column_blob(stmt, i as std::os::raw::c_int) };
+                    if ptr.is_null() {
+                        PyBytes::new_bound(py, &[]).into_any().unbind()
+                    } else {
+                        let len =
+                            unsafe { ffi::sqlite3_column_bytes(stmt, i as std::os::raw::c_int) };
+                        let slice =
+                            unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+                        PyBytes::new_bound(py, slice).into_any().unbind()
+                    }
+                }
+                _ => py.None(),
+            }
+        })
         .collect();
     PyTuple::new_bound(py, &values).unbind()
 }
@@ -232,8 +249,8 @@ impl PyConnection {
 
     /// Execute SQL and return all rows
     ///
-    /// Uses direct SQLite→Python conversion for optimal performance,
-    /// bypassing intermediate Rust Value allocations.
+    /// Uses cached prepared statements and direct SQLite→Python conversion
+    /// for optimal performance on repeated queries.
     #[pyo3(signature = (sql, params=None))]
     fn execute_fetchall<'py>(
         &self,
@@ -243,22 +260,18 @@ impl PyConnection {
     ) -> PyResult<Py<PyList>> {
         let params = extract_params(py, params)?;
 
-        // Use prepare() + direct iteration for zero-copy conversion
-        let mut stmt = self.conn.prepare(sql).map_err(to_py_err)?;
-        stmt.bind_all(params.iter().cloned()).map_err(to_py_err)?;
-
-        let mut py_rows: Vec<Py<PyTuple>> = Vec::new();
-        while stmt.step().map_err(to_py_err)? {
-            // Convert directly from SQLite to Python, bypassing RustValue
-            py_rows.push(stmt_row_to_py_tuple(py, &stmt));
-        }
+        // Use cached query for better performance on repeated queries
+        let py_rows = self
+            .conn
+            .query_cached(sql, &params, |stmt| raw_stmt_to_py_tuple(py, stmt))
+            .map_err(to_py_err)?;
 
         Ok(PyList::new_bound(py, &py_rows).unbind())
     }
 
     /// Execute SQL and return the first row
     ///
-    /// Uses direct SQLite→Python conversion for optimal performance.
+    /// Uses cached prepared statements for optimal performance.
     #[pyo3(signature = (sql, params=None))]
     fn execute_fetchone<'py>(
         &self,
@@ -268,16 +281,10 @@ impl PyConnection {
     ) -> PyResult<Option<Py<PyTuple>>> {
         let params = extract_params(py, params)?;
 
-        // Use prepare() + direct conversion for zero-copy
-        let mut stmt = self.conn.prepare(sql).map_err(to_py_err)?;
-        stmt.bind_all(params.iter().cloned()).map_err(to_py_err)?;
-
-        if stmt.step().map_err(to_py_err)? {
-            // Convert directly from SQLite to Python, bypassing RustValue
-            Ok(Some(stmt_row_to_py_tuple(py, &stmt)))
-        } else {
-            Ok(None)
-        }
+        // Use cached query for single row
+        self.conn
+            .query_cached_one(sql, &params, |stmt| raw_stmt_to_py_tuple(py, stmt))
+            .map_err(to_py_err)
     }
 
     /// Create a cursor for iterating over results
@@ -399,48 +406,38 @@ impl PyCursor {
 
     /// Fetch all remaining rows
     ///
-    /// Uses direct SQLite→Python conversion for optimal performance.
+    /// Uses cached prepared statements for optimal performance.
     fn fetchall<'py>(&mut self, py: Python<'py>) -> PyResult<Py<PyList>> {
         if !self.executed {
             self.execute()?;
         }
 
-        // Use prepare() + direct iteration for zero-copy conversion
-        let mut stmt = self.conn.prepare(&self.sql).map_err(to_py_err)?;
-        stmt.bind_all(self.params.iter().cloned())
+        // Use cached query
+        let py_rows = self
+            .conn
+            .query_cached(&self.sql, &self.params, |stmt| raw_stmt_to_py_tuple(py, stmt))
             .map_err(to_py_err)?;
-
-        let mut py_rows: Vec<Py<PyTuple>> = Vec::new();
-        while stmt.step().map_err(to_py_err)? {
-            py_rows.push(stmt_row_to_py_tuple(py, &stmt));
-        }
 
         Ok(PyList::new_bound(py, &py_rows).unbind())
     }
 
     /// Fetch the next row
     ///
-    /// Uses direct SQLite→Python conversion for optimal performance.
+    /// Uses cached prepared statements for optimal performance.
     fn fetchone<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Py<PyTuple>>> {
         if !self.executed {
             self.execute()?;
         }
 
-        // Use prepare() + direct conversion for zero-copy
-        let mut stmt = self.conn.prepare(&self.sql).map_err(to_py_err)?;
-        stmt.bind_all(self.params.iter().cloned())
-            .map_err(to_py_err)?;
-
-        if stmt.step().map_err(to_py_err)? {
-            Ok(Some(stmt_row_to_py_tuple(py, &stmt)))
-        } else {
-            Ok(None)
-        }
+        // Use cached query for single row
+        self.conn
+            .query_cached_one(&self.sql, &self.params, |stmt| raw_stmt_to_py_tuple(py, stmt))
+            .map_err(to_py_err)
     }
 
     /// Fetch many rows
     ///
-    /// Uses direct SQLite→Python conversion for optimal performance.
+    /// Uses cached prepared statements for optimal performance.
     #[pyo3(signature = (size=None))]
     fn fetchmany<'py>(&mut self, py: Python<'py>, size: Option<usize>) -> PyResult<Py<PyList>> {
         let size = size.unwrap_or(100);
@@ -457,19 +454,15 @@ impl PyCursor {
             format!("{} LIMIT {}", self.sql, size)
         };
 
-        // Use prepare() + direct iteration for zero-copy conversion
-        let mut stmt = self.conn.prepare(&limited_sql).map_err(to_py_err)?;
-        stmt.bind_all(self.params.iter().cloned())
+        // Use cached query
+        let py_rows = self
+            .conn
+            .query_cached(&limited_sql, &self.params, |stmt| raw_stmt_to_py_tuple(py, stmt))
             .map_err(to_py_err)?;
 
-        let mut py_rows: Vec<Py<PyTuple>> = Vec::new();
-        let mut count = 0;
-        while count < size && stmt.step().map_err(to_py_err)? {
-            py_rows.push(stmt_row_to_py_tuple(py, &stmt));
-            count += 1;
-        }
-
-        Ok(PyList::new_bound(py, &py_rows).unbind())
+        // Take only up to 'size' rows
+        let limited: Vec<_> = py_rows.into_iter().take(size).collect();
+        Ok(PyList::new_bound(py, &limited).unbind())
     }
 
     /// Get column names
