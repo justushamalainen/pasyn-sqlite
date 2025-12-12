@@ -385,17 +385,34 @@ impl WriterServer {
 
             // Process all pending requests
             if !all_pending.is_empty() {
-                let mut responses: Vec<Response> = Vec::with_capacity(all_pending.len());
+                // Check if any request involves transaction locking
+                let has_tx_operations = tx_lock.is_some()
+                    || all_pending.iter().any(|p| {
+                        p.request.transaction_token.is_some()
+                            || matches!(
+                                p.request.request_type,
+                                RequestType::AcquireTransactionLock
+                                    | RequestType::ReleaseTransactionLock
+                            )
+                    });
 
-                for pending in &all_pending {
-                    let response = self.process_request_with_lock(
-                        &conn,
-                        pending,
-                        &mut tx_lock,
-                        &mut next_token,
-                    );
-                    responses.push(response);
-                }
+                let responses = if has_tx_operations {
+                    // Process individually with lock handling
+                    all_pending
+                        .iter()
+                        .map(|pending| {
+                            self.process_request_with_lock(
+                                &conn,
+                                pending,
+                                &mut tx_lock,
+                                &mut next_token,
+                            )
+                        })
+                        .collect()
+                } else {
+                    // Use batching optimization for normal requests
+                    self.process_batch_multi_client(&conn, &all_pending)
+                };
 
                 // Send responses back to respective clients
                 for (pending, response) in all_pending.iter().zip(responses.iter()) {
