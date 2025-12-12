@@ -50,7 +50,7 @@ impl ServerConfig {
             socket_path: socket_path.as_ref().to_path_buf(),
             busy_timeout_ms: 5000,
             wal_mode: true,
-            max_batch_size: 100,
+            max_batch_size: 75,
             enable_batching: true,
             tx_lock_timeout_ms: DEFAULT_TX_LOCK_TIMEOUT_MS,
         }
