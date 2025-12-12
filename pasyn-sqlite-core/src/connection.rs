@@ -418,8 +418,8 @@ impl Drop for Connection {
 /// This connection type can be safely shared across threads using `Arc<ThreadSafeConnection>`
 /// without requiring a Mutex. It achieves this by:
 ///
-/// 1. Opening the database with `SQLITE_OPEN_FULLMUTEX` flag, which makes SQLite
-///    serialize all access internally
+/// 1. SQLite is compiled with SQLITE_THREADSAFE=1 (serialized mode) by default,
+///    which makes it internally thread-safe
 /// 2. Using statement-per-query pattern - each query creates its own statement
 ///    that is used and dropped within the same call
 /// 3. Returning only owned data (no borrowed references that could escape)
@@ -442,28 +442,22 @@ pub struct ThreadSafeConnection {
     db: *mut ffi::sqlite3,
 }
 
-// SAFETY: The connection is opened with FULLMUTEX flag, which makes SQLite
-// serialize all access internally. Combined with the statement-per-query pattern
-// (no statement state escapes method boundaries), this is safe for concurrent access.
+// SAFETY: SQLite is compiled with SQLITE_THREADSAFE=1 (serialized mode) by default,
+// which makes all SQLite operations thread-safe. Combined with the statement-per-query
+// pattern (no statement state escapes method boundaries), this is safe for concurrent access.
 unsafe impl Send for ThreadSafeConnection {}
 unsafe impl Sync for ThreadSafeConnection {}
 
 impl ThreadSafeConnection {
-    /// Open a database connection with full mutex (thread-safe)
+    /// Open a database connection (thread-safe)
     ///
-    /// The connection is opened with `SQLITE_OPEN_FULLMUTEX` which makes SQLite
-    /// serialize all access internally.
+    /// SQLite's default serialized mode handles thread safety internally.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_with_flags(path, OpenFlags::default_readwrite())
     }
 
     /// Open a database connection with specific flags
-    ///
-    /// The `FULLMUTEX` flag is automatically added to ensure thread safety.
     pub fn open_with_flags<P: AsRef<Path>>(path: P, flags: OpenFlags) -> Result<Self> {
-        // Always add FULLMUTEX for thread safety
-        let flags = flags.union(OpenFlags::FULLMUTEX);
-
         let path_str = path.as_ref().to_string_lossy();
         let c_path = CString::new(path_str.as_bytes())?;
 
