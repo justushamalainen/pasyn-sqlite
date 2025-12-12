@@ -560,6 +560,48 @@ impl ThreadSafeConnection {
         }
     }
 
+    /// Query with custom row conversion
+    ///
+    /// This method allows converting rows directly without intermediate Value allocation.
+    /// The closure receives a reference to the Statement for each row and should return
+    /// the converted value.
+    pub fn query_map<T, F>(&self, sql: &str, params: &[Value], mut f: F) -> Result<Vec<T>>
+    where
+        F: FnMut(&Statement) -> T,
+    {
+        let mut stmt = Statement::prepare(self.db, sql)?;
+        stmt.bind_all(params.iter().cloned())?;
+
+        let mut results = Vec::new();
+        while stmt.step()? {
+            results.push(f(&stmt));
+        }
+        Ok(results)
+    }
+
+    /// Query single row with custom conversion
+    pub fn query_row_map<T, F>(&self, sql: &str, params: &[Value], f: F) -> Result<Option<T>>
+    where
+        F: FnOnce(&Statement) -> T,
+    {
+        let mut stmt = Statement::prepare(self.db, sql)?;
+        stmt.bind_all(params.iter().cloned())?;
+
+        if stmt.step()? {
+            Ok(Some(f(&stmt)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Prepare a statement for manual iteration
+    ///
+    /// This is useful when you need more control over statement execution
+    /// or want to do custom conversion.
+    pub fn prepare(&self, sql: &str) -> Result<Statement> {
+        Statement::prepare(self.db, sql)
+    }
+
     /// Execute the same SQL statement with multiple parameter sets
     pub fn execute_many(&self, sql: &str, params_batch: &[Vec<Value>]) -> Result<usize> {
         let mut stmt = Statement::prepare(self.db, sql)?;
