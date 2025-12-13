@@ -112,6 +112,7 @@ class APSWMainThreadSQLite(BaseSQLiteImplementation):
 
     def __init__(self) -> None:
         self._conn: apsw.Connection | None = None
+        self._in_transaction: bool = False
 
     async def setup(self, db_path: str) -> None:
         self._conn = apsw.Connection(db_path)
@@ -127,9 +128,23 @@ class APSWMainThreadSQLite(BaseSQLiteImplementation):
         assert self._conn is not None
         self._conn.executemany(sql, parameters)
 
+    async def begin_transaction(self) -> None:
+        assert self._conn is not None
+        if not self._in_transaction:
+            self._conn.execute("BEGIN")
+            self._in_transaction = True
+
     async def commit(self) -> None:
-        # APSW uses autocommit by default, commit is a no-op unless in explicit transaction
-        pass
+        assert self._conn is not None
+        if self._in_transaction:
+            self._conn.execute("COMMIT")
+            self._in_transaction = False
+
+    async def rollback(self) -> None:
+        assert self._conn is not None
+        if self._in_transaction:
+            self._conn.execute("ROLLBACK")
+            self._in_transaction = False
 
     async def close(self) -> None:
         if self._conn:
