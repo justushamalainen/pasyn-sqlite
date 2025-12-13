@@ -189,11 +189,6 @@ impl PyOpenFlags {
 /// This connection uses Arc<ThreadSafeConnection> which is both Send and Sync.
 /// SQLite handles all internal locking via FULLMUTEX mode, and we use a
 /// statement-per-query pattern to avoid borrowing issues.
-///
-/// GIL Release (APSW-inspired): The GIL is released during blocking SQLite
-/// operations (prepare, step, exec) to allow Python threads to run concurrently
-/// during I/O-bound database operations. This follows APSW's proven pattern of
-/// using `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS`.
 #[pyclass(name = "Connection")]
 pub struct PyConnection {
     conn: Arc<ThreadSafeConnection>,
@@ -202,21 +197,13 @@ pub struct PyConnection {
 #[pymethods]
 impl PyConnection {
     /// Open a database connection
-    ///
-    /// GIL is released during the sqlite3_open_v2 call.
     #[new]
     #[pyo3(signature = (path, flags=None))]
-    fn new(py: Python<'_>, path: &str, flags: Option<PyOpenFlags>) -> PyResult<Self> {
+    fn new(path: &str, flags: Option<PyOpenFlags>) -> PyResult<Self> {
         let flags = flags
             .map(|f| RustOpenFlags::from_bits(f.flags))
             .unwrap_or_default();
-        let path = path.to_string();
-
-        // Release GIL during database open (can involve I/O)
-        let conn = py.allow_threads(move || {
-            ThreadSafeConnection::open_with_flags(&path, flags)
-        }).map_err(to_py_err)?;
-
+        let conn = ThreadSafeConnection::open_with_flags(path, flags).map_err(to_py_err)?;
         Ok(PyConnection {
             conn: Arc::new(conn),
         })
@@ -244,9 +231,6 @@ impl PyConnection {
     }
 
     /// Execute a SQL statement
-    ///
-    /// GIL is released during sqlite3_prepare and sqlite3_step calls,
-    /// following APSW's pattern for better concurrency.
     #[pyo3(signature = (sql, params=None))]
     fn execute<'py>(
         &self,
@@ -255,26 +239,12 @@ impl PyConnection {
         params: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<usize> {
         let params = extract_params(py, params)?;
-        let conn = self.conn.clone();
-        let sql = sql.to_string();
-
-        // Release GIL during SQLite execution
-        py.allow_threads(move || {
-            conn.execute(&sql, &params)
-        }).map_err(to_py_err)
+        self.conn.execute(sql, &params).map_err(to_py_err)
     }
 
     /// Execute multiple SQL statements
-    ///
-    /// GIL is released during sqlite3_exec call.
-    fn executescript(&self, py: Python<'_>, sql: &str) -> PyResult<()> {
-        let conn = self.conn.clone();
-        let sql = sql.to_string();
-
-        // Release GIL during batch execution
-        py.allow_threads(move || {
-            conn.execute_batch(&sql)
-        }).map_err(to_py_err)
+    fn executescript(&self, sql: &str) -> PyResult<()> {
+        self.conn.execute_batch(sql).map_err(to_py_err)
     }
 
     /// Execute SQL and return all rows
@@ -341,33 +311,18 @@ impl PyConnection {
     }
 
     /// Begin a transaction
-    ///
-    /// GIL is released during the BEGIN statement.
-    fn begin(&self, py: Python<'_>) -> PyResult<()> {
-        let conn = self.conn.clone();
-        py.allow_threads(move || {
-            conn.execute_batch("BEGIN")
-        }).map_err(to_py_err)
+    fn begin(&self) -> PyResult<()> {
+        self.conn.execute_batch("BEGIN").map_err(to_py_err)
     }
 
     /// Commit the current transaction
-    ///
-    /// GIL is released during COMMIT (can involve I/O for WAL checkpoint).
-    fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        let conn = self.conn.clone();
-        py.allow_threads(move || {
-            conn.execute_batch("COMMIT")
-        }).map_err(to_py_err)
+    fn commit(&self) -> PyResult<()> {
+        self.conn.execute_batch("COMMIT").map_err(to_py_err)
     }
 
     /// Rollback the current transaction
-    ///
-    /// GIL is released during ROLLBACK.
-    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
-        let conn = self.conn.clone();
-        py.allow_threads(move || {
-            conn.execute_batch("ROLLBACK")
-        }).map_err(to_py_err)
+    fn rollback(&self) -> PyResult<()> {
+        self.conn.execute_batch("ROLLBACK").map_err(to_py_err)
     }
 
     /// Check if in autocommit mode
@@ -575,8 +530,8 @@ fn memory_highwater(reset: bool) -> i64 {
 /// Connect to a database (convenience function)
 #[pyfunction]
 #[pyo3(signature = (path, flags=None))]
-fn connect(py: Python<'_>, path: &str, flags: Option<PyOpenFlags>) -> PyResult<PyConnection> {
-    PyConnection::new(py, path, flags)
+fn connect(path: &str, flags: Option<PyOpenFlags>) -> PyResult<PyConnection> {
+    PyConnection::new(path, flags)
 }
 
 // =============================================================================
