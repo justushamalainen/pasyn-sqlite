@@ -340,7 +340,33 @@ extern "C" {
     // Initialize/Shutdown
     pub fn sqlite3_initialize() -> c_int;
     pub fn sqlite3_shutdown() -> c_int;
+
+    // Mutex API (for thread safety like APSW)
+    pub fn sqlite3_db_mutex(db: *mut sqlite3) -> *mut sqlite3_mutex;
+    pub fn sqlite3_mutex_enter(mutex: *mut sqlite3_mutex);
+    pub fn sqlite3_mutex_leave(mutex: *mut sqlite3_mutex);
+    pub fn sqlite3_mutex_try(mutex: *mut sqlite3_mutex) -> c_int;
+
+    // Statement status (for cache optimization)
+    pub fn sqlite3_stmt_status(stmt: *mut sqlite3_stmt, op: c_int, resetFlg: c_int) -> c_int;
 }
+
+/// Opaque mutex handle
+#[repr(C)]
+pub struct sqlite3_mutex {
+    _private: [u8; 0],
+}
+
+// Statement status codes
+pub const SQLITE_STMTSTATUS_FULLSCAN_STEP: c_int = 1;
+pub const SQLITE_STMTSTATUS_SORT: c_int = 2;
+pub const SQLITE_STMTSTATUS_AUTOINDEX: c_int = 3;
+pub const SQLITE_STMTSTATUS_VM_STEP: c_int = 4;
+pub const SQLITE_STMTSTATUS_REPREPARE: c_int = 5;
+pub const SQLITE_STMTSTATUS_RUN: c_int = 6;
+pub const SQLITE_STMTSTATUS_FILTER_MISS: c_int = 7;
+pub const SQLITE_STMTSTATUS_FILTER_HIT: c_int = 8;
+pub const SQLITE_STMTSTATUS_MEMUSED: c_int = 99;
 
 /// Convert a SQLite result code to a Result type
 #[inline]
