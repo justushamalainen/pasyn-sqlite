@@ -188,6 +188,51 @@ class Pysqlite3MainThreadSQLite(BaseSQLiteImplementation):
             self._conn = None
 
 
+class RustSingleThreadSQLite(BaseSQLiteImplementation):
+    """
+    Rust-based single-thread SQLite with Python-managed lifetime (no Arc).
+
+    This uses pasyn_sqlite_core.SingleThreadConnection which:
+    - Owns the SQLite connection directly (no Arc wrapper)
+    - Has minimal overhead - Python manages the lifetime
+    - Uses statement cache for prepared statements
+    - NOT thread-safe - designed for single-threaded use
+    """
+
+    def __init__(self) -> None:
+        self._conn: pasyn_sqlite_core.SingleThreadConnection | None = None
+
+    async def setup(self, db_path: str) -> None:
+        self._conn = pasyn_sqlite_core.SingleThreadConnection(db_path)
+        self._conn.executescript("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._conn is not None
+        return self._conn.execute_fetchall(sql, list(parameters))
+
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
+        assert self._conn is not None
+        for params in parameters:
+            self._conn.execute(sql, list(params))
+
+    async def begin_transaction(self) -> None:
+        assert self._conn is not None
+        self._conn.begin()
+
+    async def commit(self) -> None:
+        assert self._conn is not None
+        self._conn.commit()
+
+    async def rollback(self) -> None:
+        assert self._conn is not None
+        self._conn.rollback()
+
+    async def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+
 class MultiplexedSQLite(BaseSQLiteImplementation):
     """
     Multiplexed client implementation using Rust thread-safe client.
@@ -286,6 +331,7 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
         "main_thread": MainThreadSQLite,
         "apsw_main_thread": APSWMainThreadSQLite,
         "pysqlite3_main_thread": Pysqlite3MainThreadSQLite,
+        "rust_single_thread": RustSingleThreadSQLite,
         "multiplexed": MultiplexedSQLite,
     }
     if name not in implementations:

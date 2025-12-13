@@ -35,6 +35,7 @@ from implementations import (
     MainThreadSQLite,
     MultiplexedSQLite,
     Pysqlite3MainThreadSQLite,
+    RustSingleThreadSQLite,
 )
 
 
@@ -871,6 +872,7 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
         ("main_thread", MainThreadSQLite()),
         ("apsw_main_thread", APSWMainThreadSQLite()),
         ("pysqlite3_main_thread", Pysqlite3MainThreadSQLite()),
+        ("rust_single_thread", RustSingleThreadSQLite()),
         ("multiplexed", MultiplexedSQLite()),
     ]
 

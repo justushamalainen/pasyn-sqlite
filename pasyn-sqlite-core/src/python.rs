@@ -6,10 +6,13 @@ use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
+use crate::cache;
 use crate::client::MultiplexedClient as RustMultiplexedClient;
+use crate::connection::Connection as RustConnection;
 use crate::connection::OpenFlags as RustOpenFlags;
 use crate::connection::ThreadSafeConnection;
 use crate::error::Error as RustError;
+use crate::ffi;
 use crate::server::{ServerConfig, ServerHandle, WriterServer};
 use crate::value::Value as RustValue;
 
@@ -383,6 +386,291 @@ impl PyConnection {
             }
             Err(_) => Ok(Vec::new()),
         }
+    }
+}
+
+// =============================================================================
+// Single-threaded Connection (Python-managed lifetime, no Arc)
+// =============================================================================
+
+/// A single-threaded SQLite connection with Python-managed lifetime
+///
+/// This connection is NOT thread-safe. It's owned directly by Python with no
+/// Arc wrapper, giving minimal overhead. Use this when you don't need to share
+/// the connection across threads.
+#[pyclass(name = "SingleThreadConnection", unsendable)]
+pub struct PySingleThreadConnection {
+    db: *mut ffi::sqlite3,
+}
+
+// NOT Send/Sync - this is intentionally single-threaded
+// Python's GIL ensures safety within a single thread
+
+impl Drop for PySingleThreadConnection {
+    fn drop(&mut self) {
+        if !self.db.is_null() {
+            // Clear statement cache before closing
+            cache::clear_cache_for_db(self.db);
+            unsafe { ffi::sqlite3_close_v2(self.db) };
+            self.db = std::ptr::null_mut();
+        }
+    }
+}
+
+#[pymethods]
+impl PySingleThreadConnection {
+    /// Open a database connection
+    #[new]
+    #[pyo3(signature = (path, flags=None))]
+    fn new(path: &str, flags: Option<PyOpenFlags>) -> PyResult<Self> {
+        let flags = flags
+            .map(|f| f.flags)
+            .unwrap_or(RustOpenFlags::default_readwrite().bits());
+
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let mut db: *mut ffi::sqlite3 = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags, std::ptr::null())
+        };
+
+        if rc != ffi::SQLITE_OK {
+            if !db.is_null() {
+                let err_msg = unsafe {
+                    std::ffi::CStr::from_ptr(ffi::sqlite3_errmsg(db))
+                        .to_string_lossy()
+                        .to_string()
+                };
+                unsafe { ffi::sqlite3_close(db) };
+                return Err(SqliteError::new_err(err_msg));
+            }
+            return Err(SqliteError::new_err(format!("SQLite error code: {}", rc)));
+        }
+
+        Ok(PySingleThreadConnection { db })
+    }
+
+    /// Open an in-memory database
+    #[staticmethod]
+    fn memory() -> PyResult<Self> {
+        Self::new(":memory:", None)
+    }
+
+    /// Execute a SQL statement with optional parameters
+    #[pyo3(signature = (sql, params=None))]
+    fn execute<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<usize> {
+        let params = extract_params(py, params)?;
+
+        // Get cached statement
+        let stmt = cache::get_cached_statement(self.db, sql)
+            .map_err(to_py_err)?;
+
+        // Bind parameters
+        self.bind_params(stmt, &params)?;
+
+        // Execute
+        let rc = unsafe { ffi::sqlite3_step(stmt) };
+        if rc != ffi::SQLITE_DONE && rc != ffi::SQLITE_ROW {
+            return Err(self.get_error());
+        }
+
+        Ok(unsafe { ffi::sqlite3_changes(self.db) } as usize)
+    }
+
+    /// Execute multiple SQL statements (no parameters)
+    fn executescript(&self, sql: &str) -> PyResult<()> {
+        let c_sql = std::ffi::CString::new(sql)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let rc = unsafe {
+            ffi::sqlite3_exec(
+                self.db,
+                c_sql.as_ptr(),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if rc != ffi::SQLITE_OK {
+            return Err(self.get_error());
+        }
+        Ok(())
+    }
+
+    /// Execute SQL and return all rows
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_fetchall<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Py<PyList>> {
+        let params = extract_params(py, params)?;
+
+        // Get cached statement
+        let stmt = cache::get_cached_statement(self.db, sql)
+            .map_err(to_py_err)?;
+
+        // Bind parameters
+        self.bind_params(stmt, &params)?;
+
+        // Collect rows
+        let mut rows: Vec<Py<PyTuple>> = Vec::new();
+        loop {
+            let rc = unsafe { ffi::sqlite3_step(stmt) };
+            match rc {
+                ffi::SQLITE_ROW => {
+                    rows.push(raw_stmt_to_py_tuple(py, stmt));
+                }
+                ffi::SQLITE_DONE => break,
+                _ => return Err(self.get_error()),
+            }
+        }
+
+        Ok(PyList::new_bound(py, &rows).unbind())
+    }
+
+    /// Execute SQL and return first row
+    #[pyo3(signature = (sql, params=None))]
+    fn execute_fetchone<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Option<Py<PyTuple>>> {
+        let params = extract_params(py, params)?;
+
+        // Get cached statement
+        let stmt = cache::get_cached_statement(self.db, sql)
+            .map_err(to_py_err)?;
+
+        // Bind parameters
+        self.bind_params(stmt, &params)?;
+
+        // Get first row
+        let rc = unsafe { ffi::sqlite3_step(stmt) };
+        match rc {
+            ffi::SQLITE_ROW => Ok(Some(raw_stmt_to_py_tuple(py, stmt))),
+            ffi::SQLITE_DONE => Ok(None),
+            _ => Err(self.get_error()),
+        }
+    }
+
+    /// Begin a transaction
+    fn begin(&self) -> PyResult<()> {
+        self.executescript("BEGIN")
+    }
+
+    /// Commit the current transaction
+    fn commit(&self) -> PyResult<()> {
+        self.executescript("COMMIT")
+    }
+
+    /// Rollback the current transaction
+    fn rollback(&self) -> PyResult<()> {
+        self.executescript("ROLLBACK")
+    }
+
+    /// Check if in autocommit mode
+    #[getter]
+    fn in_transaction(&self) -> bool {
+        unsafe { ffi::sqlite3_get_autocommit(self.db) == 0 }
+    }
+
+    /// Get the last inserted row ID
+    #[getter]
+    fn last_insert_rowid(&self) -> i64 {
+        unsafe { ffi::sqlite3_last_insert_rowid(self.db) }
+    }
+
+    /// Get the number of rows changed
+    #[getter]
+    fn changes(&self) -> i64 {
+        unsafe { ffi::sqlite3_changes(self.db) as i64 }
+    }
+
+    /// Close the connection
+    fn close(&mut self) -> PyResult<()> {
+        if !self.db.is_null() {
+            cache::clear_cache_for_db(self.db);
+            let rc = unsafe { ffi::sqlite3_close(self.db) };
+            if rc != ffi::SQLITE_OK {
+                return Err(SqliteError::new_err("Failed to close database"));
+            }
+            self.db = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        Ok(false)
+    }
+}
+
+impl PySingleThreadConnection {
+    /// Bind parameters to a statement
+    fn bind_params(&self, stmt: *mut ffi::sqlite3_stmt, params: &[RustValue]) -> PyResult<()> {
+        for (i, param) in params.iter().enumerate() {
+            let idx = (i + 1) as i32;
+            let rc = match param {
+                RustValue::Null => unsafe { ffi::sqlite3_bind_null(stmt, idx) },
+                RustValue::Integer(v) => unsafe { ffi::sqlite3_bind_int64(stmt, idx, *v) },
+                RustValue::Real(v) => unsafe { ffi::sqlite3_bind_double(stmt, idx, *v) },
+                RustValue::Text(v) => {
+                    let c_str = std::ffi::CString::new(v.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    unsafe {
+                        ffi::sqlite3_bind_text(
+                            stmt,
+                            idx,
+                            c_str.as_ptr(),
+                            v.len() as i32,
+                            ffi::sqlite_transient(),
+                        )
+                    }
+                }
+                RustValue::Blob(v) => unsafe {
+                    ffi::sqlite3_bind_blob(
+                        stmt,
+                        idx,
+                        v.as_ptr() as *const std::ffi::c_void,
+                        v.len() as i32,
+                        ffi::sqlite_transient(),
+                    )
+                },
+            };
+            if rc != ffi::SQLITE_OK {
+                return Err(self.get_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Get current error message
+    fn get_error(&self) -> PyErr {
+        let msg = unsafe {
+            std::ffi::CStr::from_ptr(ffi::sqlite3_errmsg(self.db))
+                .to_string_lossy()
+                .to_string()
+        };
+        SqliteError::new_err(msg)
     }
 }
 
@@ -1080,6 +1368,7 @@ fn multiplexed_client(socket_path: &str) -> PyResult<PyMultiplexedClient> {
 fn pasyn_sqlite_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Connection classes
     m.add_class::<PyConnection>()?;
+    m.add_class::<PySingleThreadConnection>()?;
     m.add_class::<PyCursor>()?;
     m.add_class::<PyOpenFlags>()?;
 

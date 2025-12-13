@@ -62,6 +62,8 @@ from .pasyn_sqlite_core import (
     # Multiplexed client (thread-safe with automatic batching)
     MultiplexedClient,
     OpenFlags,
+    # Single-threaded connection (Python-managed lifetime, no Arc)
+    SingleThreadConnection,
     SqliteError,
     # Writer Server classes
     WriterServerHandle,
@@ -363,6 +365,7 @@ __all__ = [
     "Connection",
     "Cursor",
     "OpenFlags",
+    "SingleThreadConnection",
     "SqliteError",
     # Writer Server classes
     "WriterServerHandle",
