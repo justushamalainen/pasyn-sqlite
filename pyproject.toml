@@ -42,6 +42,8 @@ dev = [
 ]
 bench = [
     "pasyn-sqlite-core>=0.1.0",
+    "apsw>=3.45.0.0",
+    "pysqlite3-binary>=0.5.2",
 ]
 
 [tool.pytest.ini_options]

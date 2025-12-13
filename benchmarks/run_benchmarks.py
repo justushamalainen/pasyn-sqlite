@@ -30,10 +30,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from implementations import (
+    APSWMainThreadSQLite,
     BaseSQLiteImplementation,
     MainThreadSQLite,
     MultiplexedSQLite,
-    SingleThreadSQLite,
+    Pysqlite3MainThreadSQLite,
 )
 
 
@@ -868,7 +869,8 @@ async def run_all_benchmarks(enable_huge_read: bool = False) -> None:
     """
     implementations = [
         ("main_thread", MainThreadSQLite()),
-        ("single_thread", SingleThreadSQLite()),
+        ("apsw_main_thread", APSWMainThreadSQLite()),
+        ("pysqlite3_main_thread", Pysqlite3MainThreadSQLite()),
         ("multiplexed", MultiplexedSQLite()),
     ]
 

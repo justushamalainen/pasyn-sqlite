@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
-import threading
 from abc import ABC, abstractmethod
 from collections.abc import Coroutine, Sequence
-from concurrent.futures import Future
-from dataclasses import dataclass
-from queue import Queue
 from typing import Any, Callable
 
+import apsw
 import pasyn_sqlite_core
+import pysqlite3
 
 
 class BaseSQLiteImplementation(ABC):
@@ -105,100 +102,75 @@ class MainThreadSQLite(BaseSQLiteImplementation):
             self._conn = None
 
 
-@dataclass
-class DBTask:
-    """Task for the single-thread DB worker."""
-
-    func: Callable[..., Any]
-    args: tuple[Any, ...]
-    future: Future[Any]
-
-
-class SingleThreadSQLite(BaseSQLiteImplementation):
+class APSWMainThreadSQLite(BaseSQLiteImplementation):
     """
-    SQLite running in a single background thread.
+    SQLite using APSW library running in the main thread (synchronous).
 
-    All operations (reads and writes) go through one thread.
-    Uses blocking Queue.get() - no polling, zero CPU waste when idle.
+    APSW (Another Python SQLite Wrapper) provides a thin wrapper around SQLite.
+    This is a baseline for comparing APSW with sqlite3.
     """
 
     def __init__(self) -> None:
-        self._conn: sqlite3.Connection | None = None
-        self._queue: Queue[DBTask | None] = Queue()
-        self._thread: threading.Thread | None = None
-        self._tx_lock: asyncio.Lock | None = None  # For serializing transactions
+        self._conn: apsw.Connection | None = None
 
     async def setup(self, db_path: str) -> None:
-        self._db_path = db_path
-        self._tx_lock = asyncio.Lock()
-        self._thread = threading.Thread(
-            target=self._worker_loop, daemon=True, name="single-db-thread"
-        )
-        self._thread.start()
-        # Wait for connection to be established
-        await self._submit(lambda conn: None)
-
-    def _worker_loop(self) -> None:
-        # Use isolation_level=None for autocommit mode - each statement is its own transaction
-        # This prevents implicit batching when multiple concurrent tasks submit writes
-        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
+        self._conn = apsw.Connection(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
 
-        while True:
-            # Blocks until task available - no polling!
-            task = self._queue.get()
-            if task is None:  # Shutdown sentinel
-                break
-            try:
-                result = task.func(self._conn)
-                task.future.set_result(result)
-            except Exception as e:
-                task.future.set_exception(e)
-
-        if self._conn:
-            self._conn.close()
-
-    async def _submit(self, func: Callable[[sqlite3.Connection], Any]) -> Any:
-        future: Future[Any] = Future()
-        task = DBTask(func=func, args=(), future=future)
-        self._queue.put(task)
-        return await asyncio.wrap_future(future)
-
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
-        def _execute(conn: sqlite3.Connection) -> list[Any]:
-            cursor = conn.execute(sql, parameters)
-            return cursor.fetchall()
-
-        return await self._submit(_execute)
+        assert self._conn is not None
+        cursor = self._conn.execute(sql, parameters)
+        return list(cursor)
 
     async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
-        def _executemany(conn: sqlite3.Connection) -> None:
-            conn.executemany(sql, parameters)
-
-        await self._submit(_executemany)
+        assert self._conn is not None
+        self._conn.executemany(sql, parameters)
 
     async def commit(self) -> None:
-        await self._submit(lambda conn: conn.commit())
-
-    async def run_in_transaction(
-        self, operations: Callable[[BaseSQLiteImplementation], Coroutine[Any, Any, Any]]
-    ) -> None:
-        """Run operations within a transaction - serialized with lock."""
-        assert self._tx_lock is not None
-        async with self._tx_lock:
-            await self.begin_transaction()
-            try:
-                await operations(self)
-                await self.commit()
-            except Exception:
-                await self.rollback()
-                raise
+        # APSW uses autocommit by default, commit is a no-op unless in explicit transaction
+        pass
 
     async def close(self) -> None:
-        self._queue.put(None)  # Send shutdown sentinel
-        if self._thread:
-            self._thread.join(timeout=5.0)
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+
+class Pysqlite3MainThreadSQLite(BaseSQLiteImplementation):
+    """
+    SQLite using pysqlite3 library running in the main thread (synchronous).
+
+    pysqlite3 is a standalone package providing sqlite3 module with newer SQLite versions.
+    This is a baseline for comparing pysqlite3 with sqlite3.
+    """
+
+    def __init__(self) -> None:
+        self._conn: pysqlite3.Connection | None = None
+
+    async def setup(self, db_path: str) -> None:
+        # Use isolation_level=None for autocommit mode - each statement is its own transaction
+        self._conn = pysqlite3.connect(db_path, isolation_level=None)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+
+    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> list[Any]:
+        assert self._conn is not None
+        cursor = self._conn.execute(sql, parameters)
+        return cursor.fetchall()
+
+    async def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:
+        assert self._conn is not None
+        self._conn.executemany(sql, parameters)
+
+    async def commit(self) -> None:
+        assert self._conn is not None
+        self._conn.commit()
+
+    async def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
 
 class MultiplexedSQLite(BaseSQLiteImplementation):
@@ -297,7 +269,8 @@ def create_implementation(name: str, **kwargs: Any) -> BaseSQLiteImplementation:
     """Create an implementation by name."""
     implementations = {
         "main_thread": MainThreadSQLite,
-        "single_thread": SingleThreadSQLite,
+        "apsw_main_thread": APSWMainThreadSQLite,
+        "pysqlite3_main_thread": Pysqlite3MainThreadSQLite,
         "multiplexed": MultiplexedSQLite,
     }
     if name not in implementations:
